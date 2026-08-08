@@ -1,74 +1,27 @@
 # mockify
 
-mockify records HTTP traffic from a live web application and replays it as a
-local mock server. Point a recorder at a real site, browse around (or drive
-it programmatically), and mockify saves every request/response pair to a
-`traffic.json` file. Point the mock server at that file and it serves the
-same responses back, matched by method, path, and (for GET) query
-parameters — no live backend required.
+Record HTTP traffic from a live web app, then replay it as a local mock server — no live backend required.
 
-This is useful for developing or testing a frontend against a stable,
-offline copy of an API's behavior, including deliberately injected failure
-modes (see Fault injection, below).
+![mockify demo: logging in, replaying a captured route, and a 404 with route hints](assets/demo.gif)
 
 ## Quickstart
 
-Install dependencies and build:
-
 ```bash
-npm install
-npm run build
-```
+npm install && npm run build
 
-Record traffic from a live site. This launches a visible Chromium window;
-log in and browse around, then press Ctrl+C to save the capture:
-
-```bash
+# Record traffic from a live site (opens a visible Chromium window; browse
+# around, then Ctrl+C to save)
 npx mockify capture --url https://app.example.com
-```
 
-By default this writes to `captures/<timestamp>/traffic.json` (plus
-screenshots, console logs, and a summary) under the current directory.
-
-Serve the capture back as a mock server:
-
-```bash
+# Serve the capture back as a mock server
 npx mockify serve --data captures/2024-01-01_12-00-00/traffic.json --port 3456
 ```
 
-`--data` sets `MOCK_DATA_PATH`; `--port` sets `PORT`. If `--data` is
-omitted, the server searches `<cwd>/captures/` for a `traffic.json` (see
-"Capture discovery" below).
-
-During development you can run the CLI directly against source with `tsx`
-instead of building first:
-
-```bash
-npm run serve -- --data captures/2024-01-01_12-00-00/traffic.json
-```
-
-## Capture discovery
-
-When `MOCK_DATA_PATH` is not set, the mock server looks for traffic data
-relative to the current working directory (`process.cwd()`), in this order:
-
-1. `<cwd>/captures/mock-traffic.json`
-2. `<cwd>/captures/traffic.json`
-3. `<cwd>/captures/<subdir>/traffic.json`, most recent subdirectory first
-   (subdirectories are named by capture timestamp, so a lexicographic sort
-   picks the latest)
-
-Set `MOCK_DATA_PATH` to point directly at a specific `traffic.json` file to
-bypass this search entirely.
+If `--data` is omitted, the server searches `<cwd>/captures/` for a `traffic.json` (most recent timestamped subdirectory wins). During development, run `npm run serve -- --data <path>` to use `tsx` directly instead of building first.
 
 ## The traffic.json format
 
-`traffic.json` is a JSON array of captured request/response pairs. The
-contract is defined in `src/format/types.ts` as `CapturedTraffic`, and is
-produced both by mockify's own recorders (`src/recorders/browse-and-capture.mjs`,
-`src/recorders/cdp-capture.ts`) and by specify's capture command — mockify's
-recorders and mock server were extracted from the specify project and share
-this format with it. Each entry looks like:
+A JSON array of request/response pairs, typed as `CapturedTraffic` in `src/format/types.ts`. Produced by mockify's own recorders (`src/recorders/browse-and-capture.mjs`, `src/recorders/cdp-capture.ts`) and also by specify's capture command — mockify's recorders and mock server were extracted from the specify project and share this format with it. Consumable by specify's `spec generate`.
 
 ```json
 {
@@ -78,74 +31,37 @@ this format with it. Each entry looks like:
   "status": 200,
   "contentType": "application/json; charset=utf-8",
   "ts": 1700000000000,
-  "tsStart": 1699999999900,
-  "tsEnd": 1700000000000,
   "responseBody": "{\"widgets\":[...]}"
 }
 ```
 
-`tsStart`/`tsEnd` and `injectedFault` are optional fields not present in
-every capture; see the Roadmap below for what the mock server does and does
-not currently do with them.
-
 ## Fault injection
 
-The mock server can randomly inject failures instead of replaying the real
-captured response, to test how a frontend handles a flaky backend. Set
-`MOCK_FAULT_RATE` to a value between 0 and 1 to enable it:
+Set `MOCK_FAULT_RATE` (0–1) to randomly inject failures instead of replaying real responses, to test how a frontend handles a flaky backend:
 
 ```bash
 MOCK_FAULT_RATE=0.1 npx mockify serve --data captures/traffic.json
-# or:
-npm run serve:chaos
+# or: npm run serve:chaos
 ```
 
-Environment variables (read by `src/mock-server.ts`):
-
-- `PORT` — server port (default: `3456`)
-- `MOCK_DATA_PATH` — path to `traffic.json` (default: searches `captures/`, see above)
-- `MOCK_SESSION_COOKIE_NAME` — primary session cookie name (default: `session`)
-- `MOCK_SESSION_COOKIE_2_NAME` — optional secondary cookie name (default: empty/disabled)
-- `MOCK_SESSION_TTL_MS` — session TTL in milliseconds (default: `600000`, 10 minutes)
-- `MOCK_FAULT_RATE` — fault injection rate, `0.0`–`1.0` (default: `0`, disabled)
-- `MOCK_FAULT_TYPES` — comma-separated subset of fault types to inject: `302,500,timeout,empty,malformed` (default: all of them)
-- `MOCK_LOGIN_PATH` — login page path (default: `/login`)
-- `MOCK_POST_LOGIN_REDIRECT` — where to redirect after a successful login (default: `/`)
-- `MOCK_REFRESH_PATH` — cookie refresh endpoint path (default: `/auth/refresh`)
-
-Requests to any path other than the login page and the diagnostics
-endpoints below require a valid session cookie; `POST` to `MOCK_LOGIN_PATH`
-with any non-empty `username`/`password` form fields creates one.
+`MOCK_FAULT_TYPES` restricts which fault types are used (comma-separated subset of `302,500,timeout,empty,malformed`; default: all). Other environment variables (see `src/mock-server.ts`): `PORT`, `MOCK_DATA_PATH`, `MOCK_SESSION_COOKIE_NAME`, `MOCK_SESSION_COOKIE_2_NAME`, `MOCK_SESSION_TTL_MS`, `MOCK_LOGIN_PATH`, `MOCK_POST_LOGIN_REDIRECT`, `MOCK_REFRESH_PATH`.
 
 ## Diagnostics endpoints
 
-These do not require a session cookie:
-
-- `GET /` — index of available routes and how many captures exist for each
-- `GET /_traffic` — the full raw traffic data currently loaded
-- `GET /_faults` — fault injection configuration and live stats
-- `GET /_sessions` — currently active sessions and their remaining TTL
-
-## Roadmap
-
-Known gaps in the current extraction, in no particular order:
-
-- **Header capture and replay.** The current format records no headers, so
-  cookies/auth/CORS are not replayable.
-- **JSON request-body matching.** Currently form-encoded only.
-- **Body matching for PUT/PATCH/DELETE.** Currently routed through GET
-  matching.
-- **Latency simulation from `tsStart`/`tsEnd`.** Captured but unused.
-- **Sequence-aware/stateful replay.**
-- **A test suite.** Currently none.
+No session cookie required: `GET /` (route index), `GET /_traffic` (raw traffic data), `GET /_faults` (fault config and stats), `GET /_sessions` (active sessions).
 
 ## Spec
 
-`mockify.spec.yaml` in the repo root is a starter behavioral spec, in
-specify's v2 format, covering the behaviors described above that actually
-exist today (serving captures, the diagnostics endpoints, capturing
-traffic, and 404 handling for unknown routes). It's verifiable with
-specify itself: `specify verify --spec mockify.spec.yaml`.
+`mockify.spec.yaml` is a starter behavioral spec in specify's v2 format, verifiable with `specify verify --spec mockify.spec.yaml`.
+
+## Roadmap
+
+- Header capture and replay (cookies/auth/CORS not currently replayable)
+- JSON request-body matching (currently form-encoded only)
+- Body matching for PUT/PATCH/DELETE (currently routed through GET matching)
+- Latency simulation from `tsStart`/`tsEnd` (captured but unused)
+- Sequence-aware/stateful replay
+- A test suite (currently none)
 
 ## License
 
