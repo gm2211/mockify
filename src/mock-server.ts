@@ -15,7 +15,7 @@
  *
  * Configuration (via .env or environment variables):
  *   PORT                       — server port (default: 3456)
- *   MOCK_DATA_PATH             — path to traffic.json (default: searches captures/)
+ *   MOCK_DATA_PATH             — path to traffic.json or a capture directory (default: searches captures/)
  *   MOCK_SESSION_COOKIE_NAME   — primary session cookie name (default: session)
  *   MOCK_SESSION_COOKIE_2_NAME — optional secondary cookie name (default: empty)
  *   MOCK_SESSION_TTL_MS        — session TTL in ms (default: 600000 = 10 min)
@@ -302,10 +302,25 @@ function loadTraffic(): { entries: TrafficEntry[]; index: RouteIndex } {
 
   let trafficPath: string | undefined;
   for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      trafficPath = candidate;
-      break;
+    if (!fs.existsSync(candidate)) continue;
+
+    let resolved = candidate;
+    try {
+      if (fs.statSync(candidate).isDirectory()) {
+        // A candidate that's a directory (e.g. --data pointing straight at a
+        // capture directory rather than its traffic.json) is only accepted
+        // if traffic.json actually exists inside it — otherwise keep
+        // searching the remaining candidates instead of failing here.
+        const withinDir = path.join(candidate, 'traffic.json');
+        if (!fs.existsSync(withinDir)) continue;
+        resolved = withinDir;
+      }
+    } catch {
+      continue;
     }
+
+    trafficPath = resolved;
+    break;
   }
 
   if (!trafficPath) {
