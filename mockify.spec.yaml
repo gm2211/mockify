@@ -1,0 +1,89 @@
+version: "2"
+name: "mockify"
+description: >
+  Behavioral contract for mockify: a mock server that replays captured HTTP
+  traffic, and recorders that produce the captures it replays. This is a
+  starter spec covering only what the current extraction actually
+  implements — see the Roadmap section of README.md for known gaps that are
+  deliberately not claimed here.
+
+target:
+  type: cli
+  binary: npx tsx src/cli.ts
+
+areas:
+  - id: serve
+    name: "Mock Server"
+    prose: >
+      `mockify serve --data <path>` starts an HTTP server that loads a
+      traffic.json capture and replays entries matched by HTTP method and
+      URL path. Every route except the diagnostics endpoints and the login
+      page requires a valid session cookie, obtained by posting credentials
+      to the login path.
+    behaviors:
+      - id: starts-and-loads-capture
+        description: >
+          Running `mockify serve --data <path>` starts an HTTP server on the
+          configured port, loads the traffic.json capture at that path, and
+          logs how many entries and unique routes were loaded.
+      - id: login-creates-session
+        description: >
+          POSTing non-empty username and password form fields to the login
+          path (default /login) creates a session, sets a session cookie,
+          and redirects to the post-login redirect path.
+      - id: unauthenticated-request-redirects-to-login
+        description: >
+          A request to any route other than the diagnostics endpoints and
+          the login page, made without a valid session cookie, receives a
+          302 redirect to the login path.
+      - id: replays-captured-route
+        description: >
+          A request matching a captured route's method and path, made with
+          a valid session cookie, is served the captured response verbatim:
+          same HTTP status, same Content-Type, same response body.
+      - id: unknown-route-returns-404-with-hints
+        description: >
+          A request whose method and path have no matching entry in the
+          loaded capture returns a 404 JSON body containing the requested
+          route, a hint to check the route index, and (when any exist) a
+          list of similarly-named known routes.
+
+  - id: diagnostics
+    name: "Diagnostics Endpoints"
+    prose: >
+      Four read-only endpoints expose the server's internal state for
+      debugging. None of them require a session cookie.
+    behaviors:
+      - id: root-lists-routes
+        description: >
+          GET / returns a plain-text index of every route derivable from
+          the loaded capture, with the number of captured entries behind
+          each route.
+      - id: traffic-endpoint-returns-raw-capture
+        description: >
+          GET /_traffic returns the full raw traffic array currently
+          loaded, as JSON.
+      - id: faults-endpoint-returns-fault-state
+        description: >
+          GET /_faults returns the current fault-injection configuration
+          (whether it's enabled, the rate, the enabled fault types) and
+          live fault-injection stats, as JSON.
+      - id: sessions-endpoint-returns-active-sessions
+        description: >
+          GET /_sessions returns the list of currently active sessions
+          (with the session cookie value truncated) and each session's
+          remaining TTL, as JSON.
+
+  - id: capture
+    name: "Traffic Capture"
+    prose: >
+      `mockify capture` drives a real browser against a live target and
+      records the traffic it sees into the same traffic.json format the
+      mock server replays.
+    behaviors:
+      - id: capture-records-traffic-json
+        description: >
+          Running `mockify capture --url <url>` launches a visible browser
+          against the given URL; on Ctrl+C it writes a traffic.json file
+          (plus console.json, screenshots, and a summary.txt) to a
+          timestamped output directory under captures/.

@@ -1,0 +1,26 @@
+{
+  "name": "mockify",
+  "version": "0.1.0",
+  "description": "Record HTTP traffic from a live site and replay it as a mock server",
+  "type": "module",
+  "license": "GPL-3.0",
+  "bin": {
+    "mockify": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "serve": "tsx src/cli.ts serve",
+    "capture": "tsx src/cli.ts capture",
+    "serve:chaos": "MOCK_FAULT_RATE=0.1 tsx src/cli.ts serve"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.2",
+    "playwright": "^1.50.0"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.33.0",
+    "@types/node": "^22.13.4",
+    "tsx": "^4.22.4",
+    "typescript": "^5.4.5"
+  }
+}
