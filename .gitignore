@@ -3,3 +3,7 @@ dist/
 captures/
 *.log
 .DS_Store
+
+# local credentials
+.env
+.env.local
