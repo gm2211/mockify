@@ -13,6 +13,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 
@@ -25,6 +26,14 @@ const KEYCHAIN_PREFIX = 'keychain:';
  * shared with (or readable by) mockify.
  */
 const KEYCHAIN_ACCOUNT = 'mockify';
+
+// Pin every keychain operation to the user's login keychain. Without an
+// explicit keychain, `security` walks the default search list — which includes
+// /Library/Keychains/System.keychain — and merely reaching that one makes
+// macOS raise a modal "security wants to make changes / enter an
+// administrator's name and password" prompt. Mockify never needs the System
+// keychain, so naming the login keychain keeps the flow prompt-free.
+const LOGIN_KEYCHAIN = path.join(os.homedir(), 'Library', 'Keychains', 'login.keychain-db');
 /** Keychain item/service names go straight into a `security -i` command line (not argv), so restrict them to a safe token charset. */
 const SAFE_KEYCHAIN_NAME = /^[A-Za-z0-9._-]+$/;
 
@@ -105,7 +114,13 @@ function runSecurityInteractive(commandLine: string): Promise<{ code: number | n
 
 function runSecurityFind(name: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn('security', ['find-generic-password', '-s', name, '-a', KEYCHAIN_ACCOUNT, '-w']);
+    const child = spawn('security', [
+      'find-generic-password',
+      '-s', name,
+      '-a', KEYCHAIN_ACCOUNT,
+      '-w',
+      LOGIN_KEYCHAIN,
+    ]);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
@@ -152,7 +167,7 @@ async function writeKeychain(name: string, json: string): Promise<{ ok: true } |
   }
   try {
     const b64 = Buffer.from(json, 'utf-8').toString('base64');
-    const commandLine = `add-generic-password -U -a ${KEYCHAIN_ACCOUNT} -s ${name} -w '${b64}'`;
+    const commandLine = `add-generic-password -U -a ${KEYCHAIN_ACCOUNT} -s ${name} -w '${b64}' '${LOGIN_KEYCHAIN}'`;
     const { code, stderr } = await runSecurityInteractive(commandLine);
     if (code !== 0) {
       return { ok: false, error: { error: 'keychain_error', target: `keychain:${name}`, hint: stderr.trim().split('\n').pop() || 'security -i failed' } };

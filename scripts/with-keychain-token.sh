@@ -13,7 +13,10 @@ fi
 service="$1"
 shift
 
-CLAUDE_CODE_OAUTH_TOKEN="$(security find-generic-password -s "$service" -w)"
+# Pin the lookup to the login keychain. Without an explicit keychain, `security`
+# searches the default list — which includes /Library/Keychains/System.keychain —
+# and touching that raises a modal admin-password prompt.
+CLAUDE_CODE_OAUTH_TOKEN="$(security find-generic-password -s "$service" -w "$HOME/Library/Keychains/login.keychain-db")"
 export CLAUDE_CODE_OAUTH_TOKEN
 
 exec "$@"
