@@ -93,7 +93,13 @@ const timestamp = new Date()
   .replace("T", "_")
   .slice(0, 19);
 
-const outputDir = join(outputBase, timestamp);
+// CAPTURE_EXACT_OUTPUT_DIR — set by `mockify capture --manual` (src/cli.ts)
+// when the caller already resolved a named capture directory (via
+// src/captures/store.ts's allocateCaptureDir). When present it's used
+// verbatim as outputDir instead of nesting a timestamp subdir under
+// outputBase, so a manual capture ends up at `captures/<name>/` just like
+// agent/MCP captures do, and is discoverable via `mockify list`.
+const outputDir = process.env.CAPTURE_EXACT_OUTPUT_DIR ?? join(outputBase, timestamp);
 const screenshotDir = join(outputDir, "screenshots");
 
 // ---------------------------------------------------------------------------

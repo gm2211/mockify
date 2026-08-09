@@ -27,6 +27,7 @@ import { CaptureCollector } from '../agent/capture.js';
 import { ObservationRecorder } from '../agent/observation.js';
 import { executeCommand, type AgentCommand, type StepRecorder } from '../agent/executor.js';
 import { generateSynthetic } from '../synthesize/generate.js';
+import { allocateCaptureDir } from '../captures/store.js';
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -47,6 +48,9 @@ export interface McpCaptureSession {
   observationRecorder: StepRecorder & Pick<ObservationRecorder, 'save'>;
   outputDir: string;
   url: string;
+  /** The capture's registry name (src/captures/store.ts) — what `mockify
+   * list`/`mockify replay <name>` will show/accept for this capture. */
+  name: string;
 }
 
 export interface SessionStore {
@@ -93,18 +97,7 @@ function noSessionResult(action: string): ToolResult {
 // capture_start — launch a headless browser session
 // ---------------------------------------------------------------------------
 
-function defaultOutputDir(): string {
-  // Matches src/cli.ts's defaultOutputDir() exactly, so `mockify capture` and
-  // `mockify mcp` produce directories that sort and look the same way.
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, '-')
-    .replace('T', '_')
-    .slice(0, 19);
-  return path.join(process.cwd(), 'captures', timestamp);
-}
-
-async function launchCaptureSession(url: string, outputDir: string): Promise<McpCaptureSession> {
+async function launchCaptureSession(url: string, outputDir: string, name: string): Promise<McpCaptureSession> {
   const { chromium } = await import('playwright');
 
   const collector = new CaptureCollector({
@@ -133,7 +126,7 @@ async function launchCaptureSession(url: string, outputDir: string): Promise<Mcp
     const initialScreenshot = await collector.screenshot(page, 'initial');
     await observationRecorder.endStep({ success: true, screenshot: initialScreenshot });
 
-    return { browser, page, collector, observationRecorder, outputDir, url };
+    return { browser, page, collector, observationRecorder, outputDir, url, name };
   } catch (err) {
     await browser.close().catch(() => {});
     throw err;
@@ -142,7 +135,7 @@ async function launchCaptureSession(url: string, outputDir: string): Promise<Mcp
 
 async function handleCaptureStart(
   store: SessionStore,
-  args: { url: string; outputDir?: string },
+  args: { url: string; outputDir?: string; name?: string },
 ): Promise<ToolResult> {
   try {
     new URL(args.url);
@@ -157,14 +150,26 @@ async function handleCaptureStart(
     });
   }
 
-  const outputDir = path.resolve(process.cwd(), args.outputDir ?? defaultOutputDir());
+  // An explicit outputDir bypasses naming entirely (mirrors `mockify capture
+  // --output`); otherwise the name defaults from the URL's slug (`--name`
+  // overrides), same as the CLI path.
+  let outputDir: string;
+  let name: string;
+  if (args.outputDir) {
+    outputDir = path.resolve(process.cwd(), args.outputDir);
+    name = path.basename(outputDir);
+  } else {
+    const allocated = allocateCaptureDir(args.url, args.name);
+    outputDir = allocated.dir;
+    name = allocated.name;
+  }
   fs.mkdirSync(outputDir, { recursive: true });
 
   try {
-    const session = await launchCaptureSession(args.url, outputDir);
+    const session = await launchCaptureSession(args.url, outputDir, name);
     store.set(session);
     const title = await session.page.title().catch(() => '');
-    return ok({ outputDir, title, url: session.page.url() });
+    return ok({ outputDir, name, title, url: session.page.url() });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return fail({ error: `capture_start failed: ${message}` });
@@ -220,6 +225,7 @@ async function handleCaptureFinish(
 
   return ok({
     outputDir: session.outputDir,
+    name: session.name,
     requestCount: manifest.session.totalRequests,
     screenshotCount: manifest.session.totalScreenshots,
     consoleCount: manifest.session.consoleLogCount,
@@ -455,8 +461,12 @@ const SESSION_TOOL_DEFS: ToolDef[] = [
     name: 'capture_start',
     description:
       'Start a capture session: launches a headless browser, navigates to the given URL, and begins recording traffic/console/screenshots. Errors if a session is already open.',
-    inputSchema: { url: z.string().describe('Target URL to open and capture'), outputDir: z.string().optional().describe('Output directory (default: captures/<ISO-timestamp> under cwd)') },
-    handler: (store: SessionStore) => (args: { url: string; outputDir?: string }) => handleCaptureStart(store, args),
+    inputSchema: {
+      url: z.string().describe('Target URL to open and capture'),
+      name: z.string().optional().describe('Name to save the capture under (default: slugified from the URL, e.g. "automationintesting-online"). Ignored when outputDir is given.'),
+      outputDir: z.string().optional().describe('Output directory, bypassing name-based capture storage entirely (default: captures/<name> under cwd)'),
+    },
+    handler: (store: SessionStore) => (args: { url: string; outputDir?: string; name?: string }) => handleCaptureStart(store, args),
   },
   {
     name: 'capture_finish',

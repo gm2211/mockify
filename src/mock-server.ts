@@ -47,6 +47,7 @@ import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { pathToFileURL } from 'url';
 import type { CapturedTraffic } from './format/types.js';
 import {
   loadSyntheticIndex,
@@ -65,7 +66,7 @@ const PROJECT_ROOT = process.cwd();
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-const PORT = parseInt(process.env.PORT ?? '3456', 10);
+const DEFAULT_PORT = parseInt(process.env.PORT ?? '3456', 10);
 const SESSION_COOKIE_NAME = process.env.MOCK_SESSION_COOKIE_NAME ?? 'session';
 const SESSION_COOKIE_2_NAME = process.env.MOCK_SESSION_COOKIE_2_NAME ?? '';
 const SESSION_TTL_MS = parseInt(process.env.MOCK_SESSION_TTL_MS ?? String(10 * 60 * 1000), 10);
@@ -291,8 +292,9 @@ function bestPostMatch(entries: TrafficEntry[], incomingBody: string): TrafficEn
 // ---------------------------------------------------------------------------
 // Load traffic
 // ---------------------------------------------------------------------------
-function loadTraffic(): { entries: TrafficEntry[]; index: RouteIndex; captureDir: string } {
+function loadTraffic(explicitDataPath?: string): { entries: TrafficEntry[]; index: RouteIndex; captureDir: string } {
   const candidates = [
+    explicitDataPath,
     process.env.MOCK_DATA_PATH,
     path.join(PROJECT_ROOT, 'captures', 'mock-traffic.json'),
     path.join(PROJECT_ROOT, 'captures', 'traffic.json'),
@@ -767,35 +769,96 @@ function createServer(
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-const { entries, index, captureDir } = loadTraffic();
-const synthetic = SYNTHETIC_ENABLED ? loadSyntheticIndex(captureDir) : null;
-if (SYNTHETIC_ENABLED) {
-  if (synthetic) {
-    console.error(`[mock] Loaded ${synthetic.templates.length} synthetic templates`);
-  } else {
-    console.error(
-      `[mock] No synthetic/index.json found (run "mockify synthesize --data ${captureDir}" to generate one)`
-    );
-  }
-} else {
-  console.error('[mock] Synthetic replay disabled (MOCK_SYNTHETIC=0)');
+
+export interface StartMockServerOptions {
+  /** A traffic.json path, or a capture directory containing one. Falls back
+   * to MOCK_DATA_PATH, then the capture-search defaults in loadTraffic(),
+   * when omitted — so existing MOCK_DATA_PATH-driven invocations still work
+   * unchanged. */
+  dataPath?: string;
+  /** Port to listen on. Falls back to the PORT env var, then 3456. */
+  port?: number;
 }
 
-const server = createServer(entries, index, synthetic);
+export interface StartedMockServer {
+  server: http.Server;
+  port: number;
+  captureDir: string;
+  /** Total captured request/response entries loaded (traffic.json length). */
+  entryCount: number;
+  /** Number of distinct recorded routes (method+path) served — see route index at GET /. */
+  routeCount: number;
+  syntheticTemplateCount: number;
+}
 
-server.listen(PORT, () => {
-  console.error(`[mock] Specify Mock Server listening on http://localhost:${PORT}`);
-  console.error(`[mock] GET http://localhost:${PORT}/           → route index`);
-  console.error(`[mock] GET http://localhost:${PORT}/_traffic   → raw traffic data`);
-  console.error(`[mock] GET http://localhost:${PORT}/_faults    → fault injection state`);
-  console.error(`[mock] GET http://localhost:${PORT}/_sessions  → active sessions`);
-  console.error(`[mock] GET http://localhost:${PORT}/_synthetic → loaded synthetic templates`);
-  console.error(`[mock] Auth: POST http://localhost:${PORT}${LOGIN_PATH}  → create session`);
-  console.error(`[mock] Auth: GET  http://localhost:${PORT}${REFRESH_PATH}  → extend session`);
-  console.error(`[mock] Session cookie: "${SESSION_COOKIE_NAME}", TTL: ${SESSION_TTL_MS / 1000}s`);
-  if (faultRate > 0) {
-    console.error(`[mock] Fault injection ENABLED: rate=${faultRate} types=${enabledTypes.join(',')}`);
+/**
+ * Start the mock server programmatically — no env vars required. This is
+ * what `mockify replay`/`mockify serve` (src/cli.ts) and tests call; the
+ * self-start guard below (`node dist/mock-server.js` / direct `tsx`
+ * execution) is just a thin wrapper around the same function so that
+ * long-standing direct-execution invocations keep working unchanged.
+ * Resolves once the server is actually listening.
+ */
+export function startMockServer(opts: StartMockServerOptions = {}): Promise<StartedMockServer> {
+  const port = opts.port ?? DEFAULT_PORT;
+  const { entries, index, captureDir } = loadTraffic(opts.dataPath);
+  const synthetic = SYNTHETIC_ENABLED ? loadSyntheticIndex(captureDir) : null;
+  if (SYNTHETIC_ENABLED) {
+    if (synthetic) {
+      console.error(`[mock] Loaded ${synthetic.templates.length} synthetic templates`);
+    } else {
+      console.error(
+        `[mock] No synthetic/index.json found (run "mockify synthesize --data ${captureDir}" to generate one)`
+      );
+    }
   } else {
-    console.error(`[mock] Fault injection disabled (set MOCK_FAULT_RATE to enable)`);
+    console.error('[mock] Synthetic replay disabled (MOCK_SYNTHETIC=0)');
   }
-});
+
+  const server = createServer(entries, index, synthetic);
+
+  return new Promise((resolve) => {
+    server.listen(port, () => {
+      console.error(`[mock] Specify Mock Server listening on http://localhost:${port}`);
+      console.error(`[mock] GET http://localhost:${port}/           → route index`);
+      console.error(`[mock] GET http://localhost:${port}/_traffic   → raw traffic data`);
+      console.error(`[mock] GET http://localhost:${port}/_faults    → fault injection state`);
+      console.error(`[mock] GET http://localhost:${port}/_sessions  → active sessions`);
+      console.error(`[mock] GET http://localhost:${port}/_synthetic → loaded synthetic templates`);
+      console.error(`[mock] Auth: POST http://localhost:${port}${LOGIN_PATH}  → create session`);
+      console.error(`[mock] Auth: GET  http://localhost:${port}${REFRESH_PATH}  → extend session`);
+      console.error(`[mock] Session cookie: "${SESSION_COOKIE_NAME}", TTL: ${SESSION_TTL_MS / 1000}s`);
+      if (faultRate > 0) {
+        console.error(`[mock] Fault injection ENABLED: rate=${faultRate} types=${enabledTypes.join(',')}`);
+      } else {
+        console.error(`[mock] Fault injection disabled (set MOCK_FAULT_RATE to enable)`);
+      }
+      resolve({
+        server,
+        port,
+        captureDir,
+        entryCount: entries.length,
+        routeCount: index.size,
+        syntheticTemplateCount: synthetic?.templates.length ?? 0,
+      });
+    });
+  });
+}
+
+// Self-start only when this file is the process entry point (`node
+// dist/mock-server.js`, or direct `npx tsx src/mock-server.ts`) — not when
+// imported as a module by startMockServer()'s callers (src/cli.ts) or by
+// tests, which would otherwise start a second, uncoordinated server.
+function isEntryModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
+  void startMockServer();
+}

@@ -15,6 +15,16 @@ grok -p "capture https://automationintesting.online with the mockify tools"
 
 152 requests · 39 screenshots · booking, contact, and admin flows — real numbers from this run.
 
+## Discover and replay captures by name
+
+```bash
+mockify capture --url https://automationintesting.online   # saves as capture "automationintesting-online"
+mockify list                                                # table of saved captures
+mockify replay automationintesting-online                   # serves it on http://localhost:3456
+```
+
+Every capture is saved under a name (`--name` picks it explicitly, else it's slugified from the URL's hostname — `src/captures/store.ts`). `mockify list` shows target/counts/timestamp for everything saved (`--json` for machine output). `mockify replay <name|path>` starts the mock server against it — no env vars required (`--port` overrides the default 3456).
+
 ## Replay it, then go beyond it
 
 Everything recorded above replays byte-for-byte from a local mock server — no live backend, no network. But mockify's flagship trick is generalizing *past* the literal capture: only rooms 1-3 were ever recorded, and room 7 still works.
@@ -27,7 +37,7 @@ $ curl localhost:3456/api/room/7   # never recorded — synthesized on the fly, 
 {"roomid":7,"roomName":"103","roomPrice":132,"type":"Single", ...}   # X-Mockify-Synthetic: true
 ```
 
-mockify notices `/api/room/1`, `/api/room/2`, `/api/room/3` are one *endpoint template* (`/api/room/{id}`) and learns the shape of their responses. Any other id gets a plausible response generated (deterministically, via a seeded PRNG) from that observed shape — generated data, never real data, no live backend involved. A recorded exact match always wins when one exists; synthesis only kicks in on a miss. `mockify capture` runs this generation automatically (failures are non-fatal); regenerate by hand with `npx mockify synthesize --data captures/2024-01-01_12-00-00`, which writes `<captureDir>/synthetic/index.json` (loaded by the mock server at startup, see `src/synthesize/`) and `synthetic/examples.json` (human-inspectable, never read at runtime). `MOCK_SYNTHETIC=0` disables it; `GET /_synthetic` lists loaded templates and hit count.
+mockify notices `/api/room/1`, `/api/room/2`, `/api/room/3` are one *endpoint template* (`/api/room/{id}`) and learns the shape of their responses. Any other id gets a plausible response generated (deterministically, via a seeded PRNG) from that observed shape — generated data, never real data, no live backend involved. A recorded exact match always wins when one exists; synthesis only kicks in on a miss. `mockify capture` runs this generation automatically (failures are non-fatal); regenerate by hand with `npx mockify synthesize --data captures/automationintesting-online`, which writes `<captureDir>/synthetic/index.json` (loaded by the mock server at startup, see `src/synthesize/`) and `synthetic/examples.json` (human-inspectable, never read at runtime). `MOCK_SYNTHETIC=0` disables it; `GET /_synthetic` lists loaded templates and hit count.
 
 ![mockify replay demo: the mock server loading the real capture, a real captured room JSON payload, a real validation-error response, and a 404 with route hints](assets/demo.gif)
 
@@ -38,16 +48,17 @@ npm install && npm run build
 
 npx mockify capture --url https://app.example.com            # agent-driven (needs an API key or claude login; see below)
 npx mockify capture --url https://app.example.com --manual   # or drive a real browser yourself, no agent needed
-npx mockify serve --data captures/2024-01-01_12-00-00 --port 3456
+npx mockify list
+npx mockify replay app-example-com
 ```
 
-If `--data` is omitted, the server searches `<cwd>/captures/` for a `traffic.json` (most recent timestamped subdirectory wins). `--data` accepts either a `traffic.json` file directly or a capture directory containing one.
+`mockify serve [--data <path>] [--port N]` is a back-compat alias for `replay` (`--data` takes a `traffic.json` file or a capture directory; omitted, it searches `<cwd>/captures/` for the newest one).
 
 ## Agent capture
 
 `mockify capture --url <url>` is agent-driven by default: a Claude agent (`src/agent/runner.ts`) drives a real Chromium browser, surveying the app's pages and then exercising its list/detail/create/update/delete flows, pagination, filters, and error states. Traffic, console logs, and screenshots are recorded automatically; see `src/agent/prompts.ts` for the exploration strategy.
 
-**Authentication**: `ANTHROPIC_API_KEY`, a `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`), or an ambient `claude login` session — first one found wins. **Options**: `--output <dir>` (default `captures/<ISO-timestamp>`), `--headed`, `--storage-state <path|keychain:name>` / `--save-storage-state <path|keychain:name>`, `--timeout <seconds>`.
+**Authentication**: `ANTHROPIC_API_KEY`, a `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`), or an ambient `claude login` session — first one found wins. **Options**: `--name <name>` (default: slugified from `--url`), `--output <dir>` (bypasses naming entirely), `--headed`, `--storage-state <path|keychain:name>` / `--save-storage-state <path|keychain:name>`, `--timeout <seconds>`.
 
 **Manual fallback**: `--manual` skips the agent and opens a visible Chromium window for you to drive by hand — no API key needed (`src/recorders/browse-and-capture.mjs`).
 
@@ -55,7 +66,7 @@ Environment variables: `MOCKIFY_MAX_TURNS` (default 200), `MOCKIFY_MAX_BUDGET_US
 
 ## Drive it with any agent (MCP)
 
-`mockify mcp` starts a stdio [MCP](https://modelcontextprotocol.io) server exposing `capture_start`, `capture_finish`, `get_capture_guide`, and the same 13 `browser_*` tools as the built-in agent path — so grok, Codex, Claude Code, or any other MCP-capable agent can drive a capture session directly, recorded exactly like the Claude Agent SDK path above (register command shown at the top).
+`mockify mcp` starts a stdio [MCP](https://modelcontextprotocol.io) server exposing `capture_start`, `capture_finish`, `get_capture_guide`, and the same 13 `browser_*` tools as the built-in agent path — so grok, Codex, Claude Code, or any other MCP-capable agent can drive a capture session directly, recorded exactly like the Claude Agent SDK path above (register command shown at the top). `capture_start` takes the same `name` (optional) / `outputDir` (bypasses naming) as the CLI; `capture_finish` reports back the name it was saved under, so the driving agent can tell its caller what to replay.
 
 ```
 capture_start { "url": "..." } → read get_capture_guide → explore with browser_click/browser_fill/browser_goto/etc. → capture_finish { "summary": "..." }
@@ -74,11 +85,11 @@ A JSON array of request/response pairs, typed as `CapturedTraffic` in `src/forma
 Set `MOCK_FAULT_RATE` (0–1) to randomly inject failures instead of replaying real responses:
 
 ```bash
-MOCK_FAULT_RATE=0.1 npx mockify serve --data captures/traffic.json
+MOCK_FAULT_RATE=0.1 npx mockify replay demo-grok
 # or: npm run serve:chaos
 ```
 
-`MOCK_FAULT_TYPES` restricts fault types (subset of `302,500,timeout,empty,malformed`; default: all). Other env vars (see `src/mock-server.ts`): `PORT`, `MOCK_DATA_PATH`, `MOCK_AUTH` (opt-in synthetic login gate, `1` to enable, default off), `MOCK_SESSION_COOKIE_NAME`, `MOCK_SESSION_COOKIE_2_NAME`, `MOCK_SESSION_TTL_MS`, `MOCK_LOGIN_PATH`, `MOCK_POST_LOGIN_REDIRECT`, `MOCK_REFRESH_PATH`, `MOCK_SYNTHETIC` (`0` disables synthetic replay, default on).
+`MOCK_FAULT_TYPES` restricts fault types (subset of `302,500,timeout,empty,malformed`; default: all). These, and the rest below, are advanced override knobs layered on top of `replay`/`serve`, not needed for normal use (see `src/mock-server.ts`): `PORT`, `MOCK_DATA_PATH` (overridden by `replay`'s `<name>`/`--port`), `MOCK_AUTH` (opt-in login gate, default off), `MOCK_SESSION_COOKIE_NAME`, `MOCK_SESSION_COOKIE_2_NAME`, `MOCK_SESSION_TTL_MS`, `MOCK_LOGIN_PATH`, `MOCK_POST_LOGIN_REDIRECT`, `MOCK_REFRESH_PATH`, `MOCK_SYNTHETIC` (`0` disables synthetic replay). `MOCKIFY_CAPTURES_DIR` overrides where named captures live (default `<cwd>/captures`).
 
 **Diagnostics** (no session cookie required): `GET /` (route index), `GET /_traffic` (raw traffic data), `GET /_faults` (fault config and stats), `GET /_sessions` (active sessions), `GET /_synthetic` (loaded synthetic templates and hit count).
 

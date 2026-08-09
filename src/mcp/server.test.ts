@@ -208,6 +208,7 @@ function fakeSession(overrides: Partial<McpCaptureSession> = {}): McpCaptureSess
     },
     outputDir: '/tmp/out',
     url: 'https://example.com',
+    name: 'example-com',
     ...overrides,
   };
 }
