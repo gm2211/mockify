@@ -19,6 +19,7 @@ import { ObservationRecorder } from './observation.js';
 import { createBrowserMcpServer } from './browser-mcp.js';
 import { resolveStorageStateInput, saveStorageStateOutput } from './storage-state.js';
 import { getCapturePrompt } from './prompts.js';
+import { generateSynthetic } from '../synthesize/generate.js';
 
 /**
  * Numeric override from the environment for per-run agent caps
@@ -505,6 +506,18 @@ export async function runCaptureAgent(opts: CaptureAgentOptions): Promise<Captur
         // Observation trace is best-effort; never break session teardown.
       }
       session.collector.save();
+      // Generalize the capture beyond its literal exchanges — best-effort,
+      // never breaks capture teardown (see SP-lsc.2).
+      try {
+        const summary = generateSynthetic(session.collector.getTraffic(), opts.outputDir);
+        process.stderr.write(
+          `Synthesized ${summary.templateCount} endpoint template(s) → ${summary.outDir}\n`
+        );
+      } catch (err) {
+        process.stderr.write(
+          `Warning: synthesis generation failed: ${err instanceof Error ? err.message : String(err)}\n`
+        );
+      }
       await session.browser.close().catch(() => {});
     }
   }

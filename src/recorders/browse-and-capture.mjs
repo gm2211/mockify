@@ -44,7 +44,7 @@
 import { chromium } from "playwright";
 import { writeFileSync, mkdirSync } from "fs";
 import { join, extname } from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { dirname } from "path";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -261,6 +261,24 @@ function save() {
 }
 
 // ---------------------------------------------------------------------------
+// Generalize the capture beyond its literal exchanges (SP-lsc.2). This is a
+// plain .mjs file with no TypeScript build step of its own, so it dynamically
+// imports the *compiled* synthesizer from dist/ — meaning this only does
+// anything once `npm run build` has produced dist/synthesize/generate.js.
+// That's fine: it's best-effort, exactly like the rest of this function.
+// ---------------------------------------------------------------------------
+async function runSynthesis() {
+  try {
+    const generateModulePath = join(PROJECT_ROOT, "..", "dist", "synthesize", "generate.js");
+    const { generateSynthetic } = await import(pathToFileURL(generateModulePath).href);
+    const summary = generateSynthetic(traffic, outputDir);
+    console.log(`  [synthesize] ${summary.templateCount} endpoint template(s) → ${summary.outDir}`);
+  } catch (err) {
+    console.log(`  [synthesize] skipped (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Debounced screenshot after API activity
 // ---------------------------------------------------------------------------
 function scheduleApiScreenshot(page, reason) {
@@ -462,6 +480,7 @@ async function main() {
     } catch {}
 
     const endpointCount = save();
+    await runSynthesis();
 
     console.log("\n");
     console.log("┌──────────────────────────────────────────────────────────────┐");

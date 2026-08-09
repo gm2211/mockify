@@ -25,12 +25,22 @@
  *   MOCK_LOGIN_PATH            — login page path (default: /login)
  *   MOCK_POST_LOGIN_REDIRECT   — where to redirect after successful login (default: /)
  *   MOCK_REFRESH_PATH          — cookie refresh endpoint path (default: /auth/refresh)
+ *   MOCK_SYNTHETIC             — set to 0 to disable synthetic (generalized) replay (default: on)
  *
  * Diagnostic endpoints (no auth required):
  *   GET /           → route index
  *   GET /_traffic   → raw traffic data
  *   GET /_faults    → fault injection state
  *   GET /_sessions  → active sessions
+ *   GET /_synthetic → loaded synthetic templates + hit stats
+ *
+ * Requests that don't match a recorded route fall through to synthetic
+ * (generalized) replay when `<captureDir>/synthetic/index.json` exists (see
+ * src/synthesize/) — a plausible response is generated from the shape of
+ * endpoints that WERE recorded, so e.g. `/api/room/7` can succeed even
+ * though only rooms 1-3 were ever captured. Recorded exact matches always
+ * win over synthetic ones. Set MOCK_SYNTHETIC=0 to disable this and fall
+ * straight through to the 404-with-hints behavior instead.
  */
 
 import * as http from 'http';
@@ -38,6 +48,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import type { CapturedTraffic } from './format/types.js';
+import {
+  loadSyntheticIndex,
+  matchSyntheticTemplate,
+  synthesizeResponseBody,
+  type SyntheticIndex,
+} from './synthesize/generate.js';
 
 // Capture discovery is relative to the current working directory (the
 // directory `mockify serve` is run from), not this module's own location —
@@ -56,6 +72,7 @@ const SESSION_TTL_MS = parseInt(process.env.MOCK_SESSION_TTL_MS ?? String(10 * 6
 const LOGIN_PATH = (process.env.MOCK_LOGIN_PATH ?? '/login').toLowerCase();
 const POST_LOGIN_REDIRECT = process.env.MOCK_POST_LOGIN_REDIRECT ?? '/';
 const REFRESH_PATH = process.env.MOCK_REFRESH_PATH ?? '/auth/refresh';
+const SYNTHETIC_ENABLED = process.env.MOCK_SYNTHETIC !== '0';
 
 // ---------------------------------------------------------------------------
 // Session management
@@ -167,7 +184,7 @@ function buildLoginHtml(): string {
 // ---------------------------------------------------------------------------
 // Auth-exempt paths
 // ---------------------------------------------------------------------------
-const AUTH_EXEMPT_PATHS = new Set(['/', '/_traffic', '/_faults', '/_sessions']);
+const AUTH_EXEMPT_PATHS = new Set(['/', '/_traffic', '/_faults', '/_sessions', '/_synthetic']);
 // Synthetic login gate is opt-in: most captures replay cleanly without it.
 const AUTH_ENABLED = process.env.MOCK_AUTH === '1';
 
@@ -274,7 +291,7 @@ function bestPostMatch(entries: TrafficEntry[], incomingBody: string): TrafficEn
 // ---------------------------------------------------------------------------
 // Load traffic
 // ---------------------------------------------------------------------------
-function loadTraffic(): { entries: TrafficEntry[]; index: RouteIndex } {
+function loadTraffic(): { entries: TrafficEntry[]; index: RouteIndex; captureDir: string } {
   const candidates = [
     process.env.MOCK_DATA_PATH,
     path.join(PROJECT_ROOT, 'captures', 'mock-traffic.json'),
@@ -345,7 +362,7 @@ function loadTraffic(): { entries: TrafficEntry[]; index: RouteIndex } {
   console.error(
     `[mock] Loaded ${entries.length} traffic entries from ${path.basename(trafficPath)} → ${index.size} unique routes`
   );
-  return { entries, index };
+  return { entries, index, captureDir: path.dirname(trafficPath) };
 }
 
 // ---------------------------------------------------------------------------
@@ -495,8 +512,21 @@ async function injectFault(
 // ---------------------------------------------------------------------------
 const { faultRate, enabledTypes } = parseFaultConfig();
 
-function createServer(entries: TrafficEntry[], index: RouteIndex): http.Server {
+interface SyntheticStats {
+  templatesLoaded: number;
+  hits: number;
+}
+
+function createServer(
+  entries: TrafficEntry[],
+  index: RouteIndex,
+  synthetic: SyntheticIndex | null
+): http.Server {
   const loginHtml = buildLoginHtml();
+  const syntheticStats: SyntheticStats = {
+    templatesLoaded: synthetic?.templates.length ?? 0,
+    hits: 0,
+  };
 
   return http.createServer(async (req, res) => {
     const method = (req.method ?? 'GET').toUpperCase();
@@ -621,6 +651,30 @@ function createServer(entries: TrafficEntry[], index: RouteIndex): http.Server {
       return;
     }
 
+    if (method === 'GET' && pathname === '/_synthetic') {
+      const body = JSON.stringify(
+        {
+          enabled: SYNTHETIC_ENABLED,
+          templatesLoaded: syntheticStats.templatesLoaded,
+          hits: syntheticStats.hits,
+          templates: (synthetic?.templates ?? []).map((t) => ({
+            method: t.method,
+            pathTemplate: t.pathTemplate,
+            paramNames: t.paramNames,
+            status: t.status,
+            contentType: t.contentType,
+            entryCount: t.entryCount,
+          })),
+        },
+        null,
+        2
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(body);
+      console.error(`[mock] GET /_synthetic → ${syntheticStats.templatesLoaded} loaded template(s)`);
+      return;
+    }
+
     // ── Auth enforcement (opt-in via MOCK_AUTH=1) ─────────────────────────
     if (AUTH_ENABLED && !AUTH_EXEMPT_PATHS.has(pathname)) {
       const session = findValidSession(req);
@@ -636,6 +690,29 @@ function createServer(entries: TrafficEntry[], index: RouteIndex): http.Server {
     const matchedEntries = index.get(routeKey);
 
     if (!matchedEntries || matchedEntries.length === 0) {
+      // ── Synthetic fallback ────────────────────────────────────────────
+      // No recorded exchange matches exactly — before giving up, see if this
+      // request fits an endpoint template inferred from OTHER recorded
+      // requests (e.g. /api/room/7 when only /api/room/1..3 were captured).
+      if (SYNTHETIC_ENABLED && synthetic) {
+        const match = matchSyntheticTemplate(synthetic.templates, method, pathname);
+        if (match) {
+          syntheticStats.hits++;
+          const body = synthesizeResponseBody(match.template, match.params, method, pathname);
+          const responseBody =
+            typeof body === 'string' ? body : JSON.stringify(body);
+          res.writeHead(match.template.status, {
+            'Content-Type': match.template.contentType || 'application/octet-stream',
+            'X-Mockify-Synthetic': 'true',
+          });
+          res.end(responseBody);
+          console.error(
+            `[mock] SYNTH ${method} ${pathname} ← ${match.template.pathTemplate}`
+          );
+          return;
+        }
+      }
+
       const similar = Array.from(index.keys())
         .filter((k) => k.includes(pathname.split('/').slice(0, 3).join('/')))
         .sort();
@@ -690,8 +767,21 @@ function createServer(entries: TrafficEntry[], index: RouteIndex): http.Server {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-const { entries, index } = loadTraffic();
-const server = createServer(entries, index);
+const { entries, index, captureDir } = loadTraffic();
+const synthetic = SYNTHETIC_ENABLED ? loadSyntheticIndex(captureDir) : null;
+if (SYNTHETIC_ENABLED) {
+  if (synthetic) {
+    console.error(`[mock] Loaded ${synthetic.templates.length} synthetic templates`);
+  } else {
+    console.error(
+      `[mock] No synthetic/index.json found (run "mockify synthesize --data ${captureDir}" to generate one)`
+    );
+  }
+} else {
+  console.error('[mock] Synthetic replay disabled (MOCK_SYNTHETIC=0)');
+}
+
+const server = createServer(entries, index, synthetic);
 
 server.listen(PORT, () => {
   console.error(`[mock] Specify Mock Server listening on http://localhost:${PORT}`);
@@ -699,6 +789,7 @@ server.listen(PORT, () => {
   console.error(`[mock] GET http://localhost:${PORT}/_traffic   → raw traffic data`);
   console.error(`[mock] GET http://localhost:${PORT}/_faults    → fault injection state`);
   console.error(`[mock] GET http://localhost:${PORT}/_sessions  → active sessions`);
+  console.error(`[mock] GET http://localhost:${PORT}/_synthetic → loaded synthetic templates`);
   console.error(`[mock] Auth: POST http://localhost:${PORT}${LOGIN_PATH}  → create session`);
   console.error(`[mock] Auth: GET  http://localhost:${PORT}${REFRESH_PATH}  → extend session`);
   console.error(`[mock] Session cookie: "${SESSION_COOKIE_NAME}", TTL: ${SESSION_TTL_MS / 1000}s`);

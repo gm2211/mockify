@@ -15,9 +15,19 @@ grok -p "capture https://automationintesting.online with the mockify tools"
 
 152 requests · 39 screenshots · booking, contact, and admin flows — real numbers from this run.
 
-## Replay it offline
+## Replay it, then go beyond it
 
-Everything recorded above replays byte-for-byte from a local mock server — no live backend, no network:
+Everything recorded above replays byte-for-byte from a local mock server — no live backend, no network. But mockify's flagship trick is generalizing *past* the literal capture: only rooms 1-3 were ever recorded, and room 7 still works.
+
+```bash
+$ curl localhost:3456/api/room/1   # recorded — replayed byte-for-byte
+{"roomid":1,"roomName":"101","roomPrice":100,"type":"Single", ...}
+
+$ curl localhost:3456/api/room/7   # never recorded — synthesized on the fly, 200 OK
+{"roomid":7,"roomName":"103","roomPrice":132,"type":"Single", ...}   # X-Mockify-Synthetic: true
+```
+
+mockify notices `/api/room/1`, `/api/room/2`, `/api/room/3` are one *endpoint template* (`/api/room/{id}`) and learns the shape of their responses. Any other id gets a plausible response generated (deterministically, via a seeded PRNG) from that observed shape — generated data, never real data, no live backend involved. A recorded exact match always wins when one exists; synthesis only kicks in on a miss. `mockify capture` runs this generation automatically (failures are non-fatal); regenerate by hand with `npx mockify synthesize --data captures/2024-01-01_12-00-00`, which writes `<captureDir>/synthetic/index.json` (loaded by the mock server at startup, see `src/synthesize/`) and `synthetic/examples.json` (human-inspectable, never read at runtime). `MOCK_SYNTHETIC=0` disables it; `GET /_synthetic` lists loaded templates and hit count.
 
 ![mockify replay demo: the mock server loading the real capture, a real captured room JSON payload, a real validation-error response, and a 404 with route hints](assets/demo.gif)
 
@@ -68,9 +78,9 @@ MOCK_FAULT_RATE=0.1 npx mockify serve --data captures/traffic.json
 # or: npm run serve:chaos
 ```
 
-`MOCK_FAULT_TYPES` restricts fault types (subset of `302,500,timeout,empty,malformed`; default: all). Other env vars (see `src/mock-server.ts`): `PORT`, `MOCK_DATA_PATH`, `MOCK_AUTH` (opt-in synthetic login gate, `1` to enable, default off), `MOCK_SESSION_COOKIE_NAME`, `MOCK_SESSION_COOKIE_2_NAME`, `MOCK_SESSION_TTL_MS`, `MOCK_LOGIN_PATH`, `MOCK_POST_LOGIN_REDIRECT`, `MOCK_REFRESH_PATH`.
+`MOCK_FAULT_TYPES` restricts fault types (subset of `302,500,timeout,empty,malformed`; default: all). Other env vars (see `src/mock-server.ts`): `PORT`, `MOCK_DATA_PATH`, `MOCK_AUTH` (opt-in synthetic login gate, `1` to enable, default off), `MOCK_SESSION_COOKIE_NAME`, `MOCK_SESSION_COOKIE_2_NAME`, `MOCK_SESSION_TTL_MS`, `MOCK_LOGIN_PATH`, `MOCK_POST_LOGIN_REDIRECT`, `MOCK_REFRESH_PATH`, `MOCK_SYNTHETIC` (`0` disables synthetic replay, default on).
 
-**Diagnostics** (no session cookie required): `GET /` (route index), `GET /_traffic` (raw traffic data), `GET /_faults` (fault config and stats), `GET /_sessions` (active sessions).
+**Diagnostics** (no session cookie required): `GET /` (route index), `GET /_traffic` (raw traffic data), `GET /_faults` (fault config and stats), `GET /_sessions` (active sessions), `GET /_synthetic` (loaded synthetic templates and hit count).
 
 ## Spec
 

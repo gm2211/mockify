@@ -23,13 +23,23 @@
  *     capture_finish, get_capture_guide, and the 13 browser_* tools, so any
  *     MCP-capable agent (not just the Claude Agent SDK path above) can drive
  *     a capture session.
+ *
+ *   mockify synthesize --data <captureDir>
+ *     Infers endpoint templates + response shapes from a capture's
+ *     traffic.json and writes <captureDir>/synthetic/{index,examples}.json
+ *     (src/synthesize/generate.ts). Runs automatically after `mockify
+ *     capture` too; this is for regenerating on demand (e.g. after hand-
+ *     editing traffic.json).
  */
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { runCaptureAgent } from './agent/runner.js';
 import { resolveStorageStateInput } from './agent/storage-state.js';
+import { generateSynthetic } from './synthesize/generate.js';
+import type { CapturedTraffic } from './format/types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,6 +59,7 @@ function printUsage(): void {
   console.error('Commands:');
   console.error('  serve [--port N] [--data <path>]                    Start the mock server');
   console.error('  capture --url <url> [options]                       Record traffic from a live site (agent-driven by default)');
+  console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
   console.error('  mcp                                                 Start a stdio MCP server exposing capture tools to any MCP-capable agent');
   console.error('');
   console.error('capture options:');
@@ -183,6 +194,45 @@ async function runMcp(): Promise<void> {
   await startMockifyMcpServer();
 }
 
+/** Resolve a --data argument (traffic.json file OR a capture directory
+ * containing one) to the capture directory that holds/receives synthetic/. */
+function resolveCaptureDir(dataArg: string): { captureDir: string; trafficPath: string } {
+  const resolved = path.resolve(process.cwd(), dataArg);
+  if (!fs.existsSync(resolved)) {
+    console.error(`error: --data path does not exist: ${resolved}`);
+    process.exit(1);
+  }
+  if (fs.statSync(resolved).isDirectory()) {
+    const trafficPath = path.join(resolved, 'traffic.json');
+    if (!fs.existsSync(trafficPath)) {
+      console.error(`error: no traffic.json found in ${resolved}`);
+      process.exit(1);
+    }
+    return { captureDir: resolved, trafficPath };
+  }
+  return { captureDir: path.dirname(resolved), trafficPath: resolved };
+}
+
+async function runSynthesize(args: string[]): Promise<void> {
+  const data = parseFlag(args, '--data');
+  if (!data) {
+    console.error('Usage: mockify synthesize --data <captureDir>');
+    process.exit(1);
+  }
+
+  const { captureDir, trafficPath } = resolveCaptureDir(data);
+  const entries = JSON.parse(fs.readFileSync(trafficPath, 'utf8')) as CapturedTraffic[];
+  const summary = generateSynthetic(entries, captureDir);
+
+  console.error(`Synthesized ${summary.templateCount} endpoint template(s) from ${entries.length} traffic entries`);
+  console.error(`  → ${summary.indexPath}`);
+  console.error(`  → ${summary.examplesPath}`);
+  for (const t of summary.templates) {
+    const params = t.paramNames.length > 0 ? ` (params: ${t.paramNames.join(', ')})` : '';
+    console.error(`  ${t.method.padEnd(6)} ${t.pathTemplate}${params} — ${t.entryCount} sample(s)`);
+  }
+}
+
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
 
@@ -193,6 +243,9 @@ async function main(): Promise<void> {
     case 'capture':
     case 'record': // hidden alias for `capture`
       await runCapture(rest);
+      return;
+    case 'synthesize':
+      await runSynthesize(rest);
       return;
     case 'mcp':
       await runMcp();

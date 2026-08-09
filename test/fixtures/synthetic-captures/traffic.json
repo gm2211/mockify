@@ -1,0 +1,56 @@
+[
+  {
+    "url": "https://example.com/api/widgets/1",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "ts": 1700000000000,
+    "responseBody": "{\"widgetid\":1,\"name\":\"Sprocket\",\"inStock\":true,\"price\":10}"
+  },
+  {
+    "url": "https://example.com/api/widgets/2",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "ts": 1700000001000,
+    "responseBody": "{\"widgetid\":2,\"name\":\"Cog\",\"inStock\":false,\"price\":15}"
+  },
+  {
+    "url": "https://example.com/api/widgets/3",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "ts": 1700000002000,
+    "responseBody": "{\"widgetid\":3,\"name\":\"Gear\",\"inStock\":true,\"price\":22}"
+  },
+  {
+    "url": "https://example.com/api/widgets/count",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "ts": 1700000003000,
+    "responseBody": "{\"count\":42}"
+  },
+  {
+    "url": "https://example.com/api/widgets/1",
+    "method": "POST",
+    "postData": "name=Sprocket",
+    "status": 201,
+    "contentType": "application/json; charset=utf-8",
+    "ts": 1700000004000,
+    "responseBody": "{\"created\":true}"
+  },
+  {
+    "url": "https://example.com/api/orders/55",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "ts": 1700000005000,
+    "responseBody": "{\"orderid\":55,\"total\":99.5}"
+  }
+]
