@@ -26,6 +26,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CaptureCollector } from '../agent/capture.js';
 import { ObservationRecorder } from '../agent/observation.js';
 import { executeCommand, type AgentCommand, type StepRecorder } from '../agent/executor.js';
+import { generateSynthetic } from '../synthesize/generate.js';
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -193,6 +194,16 @@ async function handleCaptureFinish(
 
   const manifest = session.collector.save();
 
+  let syntheticTemplates: number | undefined;
+  try {
+    syntheticTemplates = generateSynthetic(
+      session.collector.getTraffic(),
+      session.outputDir,
+    ).templateCount;
+  } catch {
+    // Synthesis is an enhancement over the raw capture; never fail teardown.
+  }
+
   if (args.summary) {
     try {
       fs.appendFileSync(
@@ -212,6 +223,7 @@ async function handleCaptureFinish(
     requestCount: manifest.session.totalRequests,
     screenshotCount: manifest.session.totalScreenshots,
     consoleCount: manifest.session.consoleLogCount,
+    syntheticTemplates,
   });
 }
 
