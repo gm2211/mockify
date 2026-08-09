@@ -40,6 +40,24 @@ Environment variables:
 - `MOCKIFY_CAPTURE_HOST_FILTER` — comma-separated extra domains to capture traffic from beyond the target's own registrable domain, or `*` to disable host filtering entirely
 - `MOCKIFY_MODEL` — override the agent model (default: `claude-opus-4-6`)
 
+## Drive it with any agent (MCP)
+
+`mockify mcp` starts a stdio [MCP](https://modelcontextprotocol.io) server exposing `capture_start`, `capture_finish`, `get_capture_guide`, and the same 13 `browser_*` tools as the built-in agent path — so grok, Codex, Claude Code, or any other MCP-capable agent can drive a capture session directly, with every action recorded exactly like the Claude Agent SDK path above.
+
+Register it with grok (verified against `grok mcp --help`):
+
+```bash
+grok mcp add mockify -- node /path/to/mockify/dist/cli.js mcp
+```
+
+(point at your built `dist/cli.js` — an absolute path works from any cwd; run `npm run build` first). Then, in your grok session:
+
+```
+capture_start { "url": "https://app.example.com" }
+→ read get_capture_guide, explore with browser_click/browser_fill/browser_goto/etc.
+→ capture_finish { "summary": "..." }
+```
+
 ## The traffic.json format
 
 A JSON array of request/response pairs, typed as `CapturedTraffic` in `src/format/types.ts`. Produced by mockify's own recorders (`src/recorders/browse-and-capture.mjs`, `src/recorders/cdp-capture.ts`) and also by specify's capture command — mockify's recorders and mock server were extracted from the specify project and share this format with it. Consumable by specify's `spec generate`.

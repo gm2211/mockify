@@ -8,6 +8,18 @@
 import type { Page } from 'playwright';
 import type { ObservationRecorder } from './observation.js';
 
+/**
+ * Structural subset of ObservationRecorder that executeCommand actually
+ * uses. Widened from the concrete class (rather than requiring
+ * `ObservationRecorder` itself) so callers outside the built-in agent path
+ * — e.g. src/mcp/server.ts's tests — can pass a lightweight fake recorder
+ * without fighting TypeScript's nominal-ish class assignability (a `Pick<
+ * ObservationRecorder, ...>` isn't assignable to the class type because the
+ * class has private fields). A real ObservationRecorder still satisfies
+ * this interface, so existing callers are unaffected.
+ */
+export type StepRecorder = Pick<ObservationRecorder, 'beginStep' | 'endStep'>;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -50,7 +62,7 @@ export async function executeCommand(
   page: Page,
   cmd: AgentCommand,
   screenshotFn?: (name: string) => Promise<string>,
-  recorder?: ObservationRecorder,
+  recorder?: StepRecorder,
 ): Promise<CommandResult> {
   if (cmd.action === 'done') {
     return { type: 'result', action: 'done', success: true, url: page.url() };

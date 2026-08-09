@@ -17,6 +17,12 @@
  *     `--manual` instead runs the browse-and-capture recorder
  *     (src/recorders/browse-and-capture.mjs), which opens a visible browser
  *     for a human to drive. `record` is kept as a hidden alias for `capture`.
+ *
+ *   mockify mcp
+ *     Starts a stdio MCP server (src/mcp/server.ts) exposing capture_start,
+ *     capture_finish, get_capture_guide, and the 13 browser_* tools, so any
+ *     MCP-capable agent (not just the Claude Agent SDK path above) can drive
+ *     a capture session.
  */
 
 import { spawn } from 'node:child_process';
@@ -43,6 +49,7 @@ function printUsage(): void {
   console.error('Commands:');
   console.error('  serve [--port N] [--data <path>]                    Start the mock server');
   console.error('  capture --url <url> [options]                       Record traffic from a live site (agent-driven by default)');
+  console.error('  mcp                                                 Start a stdio MCP server exposing capture tools to any MCP-capable agent');
   console.error('');
   console.error('capture options:');
   console.error('  --output <dir>                Output directory (default: captures/<ISO-timestamp>)');
@@ -171,6 +178,11 @@ async function runCapture(args: string[]): Promise<void> {
   await runAgentCapture(url, args);
 }
 
+async function runMcp(): Promise<void> {
+  const { startMockifyMcpServer } = await import('./mcp/server.js');
+  await startMockifyMcpServer();
+}
+
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
 
@@ -181,6 +193,9 @@ async function main(): Promise<void> {
     case 'capture':
     case 'record': // hidden alias for `capture`
       await runCapture(rest);
+      return;
+    case 'mcp':
+      await runMcp();
       return;
     default:
       printUsage();
