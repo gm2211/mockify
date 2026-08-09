@@ -41,7 +41,7 @@ Sleep 2800ms
 # 4. Replay — clean, no env vars. (Filter out the server's own per-route
 # request logging so only the startup banner shows here; it's real output,
 # just not interleaved with the curls below.)
-Type `npx mockify replay demo-grok 2>&1 | grep -v '^\[mock\]' &`
+Type `npx mockify replay demo-grok &`
 Enter
 Sleep 2500ms
 

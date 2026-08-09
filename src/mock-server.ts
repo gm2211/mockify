@@ -26,6 +26,7 @@
  *   MOCK_POST_LOGIN_REDIRECT   — where to redirect after successful login (default: /)
  *   MOCK_REFRESH_PATH          — cookie refresh endpoint path (default: /auth/refresh)
  *   MOCK_SYNTHETIC             — set to 0 to disable synthetic (generalized) replay (default: on)
+ *   MOCK_VERBOSE               — set to 1 to log every request (default: banner + config only)
  *
  * Diagnostic endpoints (no auth required):
  *   GET /           → route index
@@ -189,6 +190,15 @@ const AUTH_EXEMPT_PATHS = new Set(['/', '/_traffic', '/_faults', '/_sessions', '
 // Synthetic login gate is opt-in: most captures replay cleanly without it.
 const AUTH_ENABLED = process.env.MOCK_AUTH === '1';
 
+// Per-request logging is opt-in. A replay server that narrates every request
+// buries its own startup banner, making `grep` the only way to read it; the
+// banner and config lines always print, request traffic only with MOCK_VERBOSE=1.
+const VERBOSE = process.env.MOCK_VERBOSE === '1';
+
+function rlog(message: string): void {
+  if (VERBOSE) console.error(message);
+}
+
 // ---------------------------------------------------------------------------
 // Traffic entry shape
 // ---------------------------------------------------------------------------
@@ -292,7 +302,7 @@ function bestPostMatch(entries: TrafficEntry[], incomingBody: string): TrafficEn
 // ---------------------------------------------------------------------------
 // Load traffic
 // ---------------------------------------------------------------------------
-function loadTraffic(explicitDataPath?: string): { entries: TrafficEntry[]; index: RouteIndex; captureDir: string } {
+function loadTraffic(explicitDataPath?: string, quiet = false): { entries: TrafficEntry[]; index: RouteIndex; captureDir: string } {
   const candidates = [
     explicitDataPath,
     process.env.MOCK_DATA_PATH,
@@ -361,7 +371,7 @@ function loadTraffic(explicitDataPath?: string): { entries: TrafficEntry[]; inde
   const entries: TrafficEntry[] = JSON.parse(raw);
   const index = buildIndex(entries);
 
-  console.error(
+  if (!quiet) console.error(
     `[mock] Loaded ${entries.length} traffic entries from ${path.basename(trafficPath)} → ${index.size} unique routes`
   );
   return { entries, index, captureDir: path.dirname(trafficPath) };
@@ -550,7 +560,7 @@ function createServer(
       if (method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(loginHtml);
-        console.error(`[mock] GET ${LOGIN_PATH} → login form`);
+        rlog(`[mock] GET ${LOGIN_PATH} → login form`);
         return;
       }
 
@@ -563,7 +573,7 @@ function createServer(
         if (!username || !password) {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
           res.end('username and password are required');
-          console.error(`[mock] POST ${LOGIN_PATH} → 400 (missing credentials)`);
+          rlog(`[mock] POST ${LOGIN_PATH} → 400 (missing credentials)`);
           return;
         }
 
@@ -586,10 +596,10 @@ function createServer(
         setSessionCookies(res, session);
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         res.end('OK');
-        console.error(`[mock] GET ${REFRESH_PATH} → 200 (session extended)`);
+        rlog(`[mock] GET ${REFRESH_PATH} → 200 (session extended)`);
       } else {
         redirectToLogin(res);
-        console.error(`[mock] GET ${REFRESH_PATH} → 302 (invalid session)`);
+        rlog(`[mock] GET ${REFRESH_PATH} → 302 (invalid session)`);
       }
       return;
     }
@@ -608,14 +618,14 @@ function createServer(
       ].join('\n');
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end(body);
-      console.error(`[mock] GET / → index (${index.size} routes)`);
+      rlog(`[mock] GET / → index (${index.size} routes)`);
       return;
     }
 
     if (method === 'GET' && pathname === '/_traffic') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(entries, null, 2));
-      console.error(`[mock] GET /_traffic → raw traffic data`);
+      rlog(`[mock] GET /_traffic → raw traffic data`);
       return;
     }
 
@@ -632,7 +642,7 @@ function createServer(
       );
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(body);
-      console.error(`[mock] GET /_faults → fault injection state`);
+      rlog(`[mock] GET /_faults → fault injection state`);
       return;
     }
 
@@ -649,7 +659,7 @@ function createServer(
       );
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(body);
-      console.error(`[mock] GET /_sessions → ${sessionList.length} active session(s)`);
+      rlog(`[mock] GET /_sessions → ${sessionList.length} active session(s)`);
       return;
     }
 
@@ -673,7 +683,7 @@ function createServer(
       );
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(body);
-      console.error(`[mock] GET /_synthetic → ${syntheticStats.templatesLoaded} loaded template(s)`);
+      rlog(`[mock] GET /_synthetic → ${syntheticStats.templatesLoaded} loaded template(s)`);
       return;
     }
 
@@ -682,7 +692,7 @@ function createServer(
       const session = findValidSession(req);
       if (!session) {
         redirectToLogin(res);
-        console.error(`[mock] AUTH: 302 → ${LOGIN_PATH} (no valid session for ${method} ${pathname})`);
+        rlog(`[mock] AUTH: 302 → ${LOGIN_PATH} (no valid session for ${method} ${pathname})`);
         return;
       }
     }
@@ -708,7 +718,7 @@ function createServer(
             'X-Mockify-Synthetic': 'true',
           });
           res.end(responseBody);
-          console.error(
+          rlog(
             `[mock] SYNTH ${method} ${pathname} ← ${match.template.pathTemplate}`
           );
           return;
@@ -731,7 +741,7 @@ function createServer(
       );
       res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(body);
-      console.error(`[mock] 404 ${method} ${pathname} (no match)`);
+      rlog(`[mock] 404 ${method} ${pathname} (no match)`);
       return;
     }
 
@@ -745,7 +755,7 @@ function createServer(
       entry = bestGetMatch(matchedEntries, parsedUrl.searchParams);
     }
 
-    console.error(
+    rlog(
       `[mock] ${method} ${pathname} → matched (${matchedEntries.length} candidate(s), status=${entry.status})`
     );
 
@@ -778,6 +788,9 @@ export interface StartMockServerOptions {
   dataPath?: string;
   /** Port to listen on. Falls back to the PORT env var, then 3456. */
   port?: number;
+  /** Suppress the server's own startup/config lines. Callers that print their
+   * own banner (`mockify replay`) set this; MOCK_VERBOSE=1 overrides it. */
+  quiet?: boolean;
 }
 
 export interface StartedMockServer {
@@ -801,37 +814,41 @@ export interface StartedMockServer {
  */
 export function startMockServer(opts: StartMockServerOptions = {}): Promise<StartedMockServer> {
   const port = opts.port ?? DEFAULT_PORT;
-  const { entries, index, captureDir } = loadTraffic(opts.dataPath);
+  // `mockify replay` prints its own banner from the resolved StartedMockServer,
+  // so it asks for silence here rather than having its banner buried under a
+  // dozen internal config lines. MOCK_VERBOSE=1 overrides.
+  const slog = opts.quiet && !VERBOSE ? () => {} : (m: string) => console.error(m);
+  const { entries, index, captureDir } = loadTraffic(opts.dataPath, opts.quiet && !VERBOSE);
   const synthetic = SYNTHETIC_ENABLED ? loadSyntheticIndex(captureDir) : null;
   if (SYNTHETIC_ENABLED) {
     if (synthetic) {
-      console.error(`[mock] Loaded ${synthetic.templates.length} synthetic templates`);
+      rlog(`[mock] Loaded ${synthetic.templates.length} synthetic templates`);
     } else {
-      console.error(
+      slog(
         `[mock] No synthetic/index.json found (run "mockify synthesize --data ${captureDir}" to generate one)`
       );
     }
   } else {
-    console.error('[mock] Synthetic replay disabled (MOCK_SYNTHETIC=0)');
+    slog('[mock] Synthetic replay disabled (MOCK_SYNTHETIC=0)');
   }
 
   const server = createServer(entries, index, synthetic);
 
   return new Promise((resolve) => {
     server.listen(port, () => {
-      console.error(`[mock] Specify Mock Server listening on http://localhost:${port}`);
-      console.error(`[mock] GET http://localhost:${port}/           → route index`);
-      console.error(`[mock] GET http://localhost:${port}/_traffic   → raw traffic data`);
-      console.error(`[mock] GET http://localhost:${port}/_faults    → fault injection state`);
-      console.error(`[mock] GET http://localhost:${port}/_sessions  → active sessions`);
-      console.error(`[mock] GET http://localhost:${port}/_synthetic → loaded synthetic templates`);
-      console.error(`[mock] Auth: POST http://localhost:${port}${LOGIN_PATH}  → create session`);
-      console.error(`[mock] Auth: GET  http://localhost:${port}${REFRESH_PATH}  → extend session`);
-      console.error(`[mock] Session cookie: "${SESSION_COOKIE_NAME}", TTL: ${SESSION_TTL_MS / 1000}s`);
+      slog(`[mock] Specify Mock Server listening on http://localhost:${port}`);
+      slog(`[mock] GET http://localhost:${port}/           → route index`);
+      slog(`[mock] GET http://localhost:${port}/_traffic   → raw traffic data`);
+      slog(`[mock] GET http://localhost:${port}/_faults    → fault injection state`);
+      slog(`[mock] GET http://localhost:${port}/_sessions  → active sessions`);
+      slog(`[mock] GET http://localhost:${port}/_synthetic → loaded synthetic templates`);
+      slog(`[mock] Auth: POST http://localhost:${port}${LOGIN_PATH}  → create session`);
+      slog(`[mock] Auth: GET  http://localhost:${port}${REFRESH_PATH}  → extend session`);
+      slog(`[mock] Session cookie: "${SESSION_COOKIE_NAME}", TTL: ${SESSION_TTL_MS / 1000}s`);
       if (faultRate > 0) {
-        console.error(`[mock] Fault injection ENABLED: rate=${faultRate} types=${enabledTypes.join(',')}`);
+        slog(`[mock] Fault injection ENABLED: rate=${faultRate} types=${enabledTypes.join(',')}`);
       } else {
-        console.error(`[mock] Fault injection disabled (set MOCK_FAULT_RATE to enable)`);
+        slog(`[mock] Fault injection disabled (set MOCK_FAULT_RATE to enable)`);
       }
       resolve({
         server,

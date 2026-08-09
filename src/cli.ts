@@ -160,7 +160,7 @@ async function runReplay(args: string[]): Promise<void> {
   }
 
   const port = parsePort(parseFlag(args, '--port'), usage);
-  const started = await startMockServer({ dataPath: resolved.dir, port });
+  const started = await startMockServer({ dataPath: resolved.dir, port, quiet: true });
 
   const summary = summarizeCapture(resolved.name, resolved.dir);
 
