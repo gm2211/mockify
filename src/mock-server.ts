@@ -21,6 +21,7 @@
  *   MOCK_SESSION_TTL_MS        — session TTL in ms (default: 600000 = 10 min)
  *   MOCK_FAULT_RATE            — fault injection rate 0.0–1.0 (default: 0 = off)
  *   MOCK_FAULT_TYPES           — comma-separated fault types: 302,500,timeout,empty,malformed
+ *   MOCK_AUTH                  — set to 1 to enable the synthetic login gate (default: off)
  *   MOCK_LOGIN_PATH            — login page path (default: /login)
  *   MOCK_POST_LOGIN_REDIRECT   — where to redirect after successful login (default: /)
  *   MOCK_REFRESH_PATH          — cookie refresh endpoint path (default: /auth/refresh)
@@ -167,6 +168,8 @@ function buildLoginHtml(): string {
 // Auth-exempt paths
 // ---------------------------------------------------------------------------
 const AUTH_EXEMPT_PATHS = new Set(['/', '/_traffic', '/_faults', '/_sessions']);
+// Synthetic login gate is opt-in: most captures replay cleanly without it.
+const AUTH_ENABLED = process.env.MOCK_AUTH === '1';
 
 // ---------------------------------------------------------------------------
 // Traffic entry shape
@@ -618,8 +621,8 @@ function createServer(entries: TrafficEntry[], index: RouteIndex): http.Server {
       return;
     }
 
-    // ── Auth enforcement ──────────────────────────────────────────────────
-    if (!AUTH_EXEMPT_PATHS.has(pathname)) {
+    // ── Auth enforcement (opt-in via MOCK_AUTH=1) ─────────────────────────
+    if (AUTH_ENABLED && !AUTH_EXEMPT_PATHS.has(pathname)) {
       const session = findValidSession(req);
       if (!session) {
         redirectToLogin(res);
