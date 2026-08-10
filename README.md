@@ -42,11 +42,11 @@ mockify doesn't just replay what it saw — it can answer requests it never reco
 
 **Shape synthesis** (automatic, no LLM involved) notices that `/api/room/1`, `/api/room/2`, and `/api/room/3` are one *endpoint template* (`/api/room/{id}`) and learns the shape of their responses. Ask for `/api/room/7`, never recorded, and you still get a plausible response, generated deterministically (a seeded PRNG) from that observed shape — generated data, never real data, no live backend involved.
 
-A recorded exact match always wins, then the implementation (if one's been generated and loaded), then synthesis. Every response carries `X-Mockify-Tier: recorded|implementation|synthetic`; synthesized responses also keep the older `X-Mockify-Synthetic: true` header:
+When an inferred implementation is loaded, it answers first — it's the only tier that can stay *self-consistent* across a sequence of requests (real routing + an in-memory store, so a `POST` and the `GET` that follows agree with each other). Recorded traffic backs it up for anything it declines; shape synthesis is the last resort. Every response carries `X-Mockify-Tier: implementation|recorded|synthetic`; synthesized responses also keep the older `X-Mockify-Synthetic: true` header:
 
 ```bash
-$ curl -i localhost:3456/api/room/1     # recorded — replayed byte-for-byte
-X-Mockify-Tier: recorded
+$ curl -i localhost:3456/api/room/1     # implementation loaded — real routing, not a lookup table
+X-Mockify-Tier: implementation
 {"roomid":1,"roomName":"101","roomPrice":100, ...}
 
 $ curl -i localhost:3456/api/room/7     # never recorded — synthesized, 200 OK
@@ -55,6 +55,8 @@ X-Mockify-Synthetic: true
 {"roomid":7,"roomName":"103","roomPrice":132, ...}
 ```
 
+`mockify replay --mode record` skips the implementation and synthesis tiers entirely and replays only what was captured, byte-for-byte — reach for it when a test needs exact determinism more than a coherent, stateful replica.
+
 `mockify capture` runs synthesis automatically (failures are non-fatal); regenerate by hand with `npx mockify synthesize --data captures/<name>`. `MOCK_SYNTHETIC=0` disables synthesis; `GET /_synthetic` and `GET /_impl` report what's loaded and hit counts for each tier.
 
 ## Replay
@@ -62,11 +64,11 @@ X-Mockify-Synthetic: true
 ```bash
 mockify list                            # table of saved captures: target, counts, timestamp
 mockify replay demo-grok                # serves it on http://localhost:3456, all tiers active
-mockify replay demo-grok --mode impl    # recorded → implementation, no shape synthesis
+mockify replay demo-grok --mode impl    # implementation → recorded, no shape synthesis
 mockify replay demo-grok --impl <path>  # try a candidate implementation without moving files
 ```
 
-No env vars, no config file — `--port` overrides the default if you need it. The banner states which tiers are active and, when an implementation is loaded, its train/holdout pass rate and hardcoding verdict from `impl/report.json` (a `likely_hardcoded` verdict prints a visible warning rather than serving silently). `--mode` (default `auto`) picks the pipeline: `auto` is the full `recorded → implementation → synthetic` chain; `record` replays only what was captured, 404 otherwise (exact-replay for regression tests); `impl` adds the inferred implementation but skips synthesis; `synthetic` skips the implementation — the escape hatch if a generated one misbehaves.
+No env vars, no config file — `--port` overrides the default if you need it. The banner states which tiers are active and, when an implementation is loaded, its train/holdout pass rate and hardcoding verdict from `impl/report.json` (a `likely_hardcoded` verdict prints a visible warning rather than serving silently). `--mode` (default `auto`) picks the pipeline: `auto` is the full `implementation → recorded → synthetic` chain; `record` replays only what was captured, 404 otherwise (byte-exact replay for regression tests, when determinism matters more than coherence); `impl` adds the inferred implementation but skips synthesis; `synthetic` skips the implementation — the escape hatch if a generated one misbehaves.
 
 ![mockify list showing a saved capture, a look at its files and inferred templates, then a clean replay banner and a recorded-vs-synthesized curl comparison](assets/demo.gif)
 

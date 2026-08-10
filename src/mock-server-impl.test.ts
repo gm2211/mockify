@@ -1,21 +1,26 @@
 /**
  * src/mock-server-impl.test.ts — the implementation tier (SP-qd4 phase 3)
  *
- * Exercises the four-tier response pipeline in src/mock-server.ts: recorded
- * → implementation → synthetic → 404. Most tests drive startMockServer()
- * in-process (see mock-server-start.test.ts) since --mode/--impl are plain
- * JS options there; the two tests that depend on an environment variable
- * (MOCKIFY_IMPL_TIMEOUT_MS, read once at module load) or on the CLI's own
- * banner text spawn the `replay` subcommand as a subprocess instead (see
- * mock-server-synthetic.test.ts for the same pattern).
+ * Exercises the four-tier response pipeline in src/mock-server.ts:
+ * implementation → recorded → synthetic → 404. Most tests drive
+ * startMockServer() in-process (see mock-server-start.test.ts) since
+ * --mode/--impl are plain JS options there; the two tests that depend on an
+ * environment variable (MOCKIFY_IMPL_TIMEOUT_MS, read once at module load)
+ * or on the CLI's own banner text spawn the `replay` subcommand as a
+ * subprocess instead (see mock-server-synthetic.test.ts for the same
+ * pattern).
  *
- * test/fixtures/impl-capture/traffic.json records exactly ONE route (GET
- * /api/items) with a body deliberately different from what
- * test/fixtures/impl/good.mjs would compute for that same path — so "does
- * recorded still win over a loaded implementation" has something real to
- * distinguish. Every other /api/items* request is unrecorded, leaving
- * good.mjs's real routing + in-memory store (seeded with ids 1-5) as the
- * only thing that can answer it.
+ * test/fixtures/impl-capture/traffic.json records two routes:
+ *   - GET /api/items — also handled by test/fixtures/impl/good.mjs, with a
+ *     recorded body deliberately different from what good.mjs would compute
+ *     for the same path, so "does the implementation now win over a
+ *     recorded response for the same route" has something real to
+ *     distinguish.
+ *   - GET /api/legacy-report — NOT handled by good.mjs, so it proves the
+ *     recorded tier still backs up whatever the implementation declines.
+ * Every other /api/items* request is unrecorded, leaving good.mjs's real
+ * routing + in-memory store (seeded with ids 1-5) as the only thing that
+ * can answer it.
  */
 
 import assert from 'node:assert/strict';
@@ -132,15 +137,61 @@ async function withReplaySubprocess(
 // Tier priority + labeling
 // ---------------------------------------------------------------------------
 
-test('mock-server impl tier: a recorded path returns the recorded body byte-for-byte, labeled recorded, even with an implementation loaded', async () => {
+test('mock-server impl tier: an implementation loaded answers a route it handles even when a recorded response exists for the same path', async () => {
   const started = await startMockServer({ dataPath: IMPL_CAPTURE_DIR, port: 0, implPath: GOOD_IMPL });
   try {
     const res = await fetch(`${serverUrl(started)}/api/items`);
     assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-mockify-tier'), 'implementation');
+    const body = await res.json();
+    // good.mjs's seeded body — NOT the recorded fixture's "RECORDED Widget Alpha".
+    // The implementation is the only tier that can stay self-consistent
+    // across a POST-then-GET sequence, so it must be tried before recorded.
+    assert.equal(body[0].name, 'Widget Alpha');
+  } finally {
+    started.server.close();
+  }
+});
+
+test('mock-server impl tier: a recorded response backs up a route the implementation declines', async () => {
+  const started = await startMockServer({ dataPath: IMPL_CAPTURE_DIR, port: 0, implPath: GOOD_IMPL });
+  try {
+    // good.mjs has no route for /api/legacy-report — it must decline and
+    // the recorded entry must answer instead.
+    const res = await fetch(`${serverUrl(started)}/api/legacy-report`);
+    assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-mockify-tier'), 'recorded');
     const body = await res.json();
-    // The recorded fixture body — NOT what good.mjs's seed would produce.
-    assert.equal(body[0].name, 'RECORDED Widget Alpha');
+    assert.match(body.note, /back it up/);
+  } finally {
+    started.server.close();
+  }
+});
+
+test('mock-server impl tier: REGRESSION — a POST answered by the implementation is reflected by a subsequent GET of a recorded collection route', async () => {
+  const started = await startMockServer({ dataPath: IMPL_CAPTURE_DIR, port: 0, implPath: GOOD_IMPL });
+  try {
+    const createRes = await fetch(`${serverUrl(started)}/api/items`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Zeta', description: 'newest prototype' }),
+    });
+    assert.equal(createRes.status, 201);
+    assert.equal(createRes.headers.get('x-mockify-tier'), 'implementation');
+
+    // GET /api/items IS recorded (see traffic.json) with a stale body that
+    // has nothing to do with this POST. Before this fix, that recorded
+    // entry always won here and the mutation could never be observed by a
+    // subsequent GET — a replica that can't agree with itself. Now the
+    // implementation answers first, so the list reflects the new item.
+    const listRes = await fetch(`${serverUrl(started)}/api/items`);
+    assert.equal(listRes.status, 200);
+    assert.equal(listRes.headers.get('x-mockify-tier'), 'implementation');
+    const list = await listRes.json();
+    assert.ok(
+      list.some((item: { name: string }) => item.name === 'Zeta'),
+      'expected the newly created item to appear in a subsequent GET of the same (recorded) route'
+    );
   } finally {
     started.server.close();
   }
@@ -313,7 +364,7 @@ test('mockify replay: the banner states the active tier chain and the implementa
   const dir = prepareImplCaptureDir(GOOD_IMPL, gapSummary);
 
   await withReplaySubprocess([dir], {}, async (_port, banner) => {
-    assert.match(banner, /tiers: recorded → implementation → synthetic/);
+    assert.match(banner, /tiers: implementation → recorded → synthetic/);
     assert.match(banner, /train 100% \/ holdout 80% pass rate, gap verdict: ok/);
     assert.doesNotMatch(banner, /likely_hardcoded/);
   });
@@ -326,7 +377,7 @@ test('mockify replay: a likely_hardcoded report.json prints a visible warning in
   const dir = prepareImplCaptureDir(GOOD_IMPL, gapSummary);
 
   await withReplaySubprocess([dir, '--mode', 'impl'], {}, async (_port, banner) => {
-    assert.match(banner, /tiers: recorded → implementation/);
+    assert.match(banner, /tiers: implementation → recorded/);
     assert.match(banner, /WARNING.*likely_hardcoded/);
   });
 });

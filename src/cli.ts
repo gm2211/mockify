@@ -188,11 +188,11 @@ function parseMode(raw: string | undefined, usage: string): ReplayMode {
 function tierChain(mode: ReplayMode): string {
   switch (mode) {
     case 'auto':
-      return 'recorded → implementation → synthetic';
+      return 'implementation → recorded → synthetic';
     case 'record':
       return 'recorded only';
     case 'impl':
-      return 'recorded → implementation';
+      return 'implementation → recorded';
     case 'synthetic':
       return 'recorded → synthetic';
   }

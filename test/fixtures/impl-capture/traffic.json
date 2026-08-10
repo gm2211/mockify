@@ -6,6 +6,15 @@
     "status": 200,
     "contentType": "application/json",
     "ts": 1000,
-    "responseBody": "[{\"id\":1,\"name\":\"RECORDED Widget Alpha\",\"description\":\"this literal recorded body must win over the implementation tier, which would answer differently\"}]"
+    "responseBody": "[{\"id\":1,\"name\":\"RECORDED Widget Alpha\",\"description\":\"this literal recorded body is shadowed once an implementation is loaded and handles this same route\"}]"
+  },
+  {
+    "url": "https://fixture.test/api/legacy-report",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 2000,
+    "responseBody": "{\"note\":\"good.mjs has no route for /api/legacy-report, so a loaded implementation must decline and this recorded response must back it up\"}"
   }
 ]

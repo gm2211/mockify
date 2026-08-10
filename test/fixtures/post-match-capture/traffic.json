@@ -1,0 +1,29 @@
+[
+  {
+    "url": "https://fixture.test/api/orders",
+    "method": "POST",
+    "postData": "{\"item\":\"Sprocket\",\"qty\":5}",
+    "status": 201,
+    "contentType": "application/json",
+    "ts": 1000,
+    "responseBody": "{\"matched\":\"sprocket-order\",\"item\":\"Sprocket\",\"qty\":5}"
+  },
+  {
+    "url": "https://fixture.test/api/orders",
+    "method": "POST",
+    "postData": "{\"item\":\"Cog\",\"qty\":9}",
+    "status": 201,
+    "contentType": "application/json",
+    "ts": 2000,
+    "responseBody": "{\"matched\":\"cog-order\",\"item\":\"Cog\",\"qty\":9}"
+  },
+  {
+    "url": "https://fixture.test/api/login",
+    "method": "POST",
+    "postData": "username=alice&password=secret",
+    "status": 200,
+    "contentType": "text/plain",
+    "ts": 3000,
+    "responseBody": "OK: alice"
+  }
+]

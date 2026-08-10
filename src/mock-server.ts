@@ -42,15 +42,22 @@
  * Every response is labeled with `X-Mockify-Tier: recorded|implementation|
  * synthetic`, first match wins:
  *
- *   1. recorded       — an exact recorded request/response match. Always
- *                        wins when one exists.
- *   2. implementation — `<captureDir>/impl/handlers.mjs` (see src/infer/),
+ *   1. implementation — `<captureDir>/impl/handlers.mjs` (see src/infer/),
  *                        a generated implementation with real routing + an
- *                        in-memory store. Wrapped in try/catch and a
- *                        wall-clock timeout (MOCKIFY_IMPL_TIMEOUT_MS); a
- *                        throw, timeout, or explicit decline (returning
- *                        null) falls through to the next tier rather than
- *                        ever 500ing.
+ *                        in-memory store. Tried first when loaded: it's the
+ *                        only tier that can stay self-consistent across a
+ *                        POST-then-GET sequence, so a state change has to
+ *                        reach it before anything else gets a chance to
+ *                        answer. Wrapped in try/catch and a wall-clock
+ *                        timeout (MOCKIFY_IMPL_TIMEOUT_MS); a throw,
+ *                        timeout, or explicit decline (returning null)
+ *                        falls through to the next tier rather than ever
+ *                        500ing.
+ *   2. recorded       — an exact recorded request/response match, scored
+ *                        against query params / POST body. Backs up
+ *                        whatever the implementation tier declined (or
+ *                        answers everything when no implementation is
+ *                        loaded).
  *   3. synthetic       — shape-based synthesis from OTHER recorded requests
  *                        that match the same endpoint template (see
  *                        src/synthesize/), e.g. `/api/room/7` succeeding
@@ -58,9 +65,11 @@
  *   4. (none)          — 404 with hints about similar known routes.
  *
  * `mockify replay --mode <auto|record|impl|synthetic>` (src/cli.ts) narrows
- * which of tiers 2/3 are consulted; recorded (tier 1) and the 404 fallback
- * are always present. Set MOCK_SYNTHETIC=0 to disable tier 3 outright
- * regardless of mode.
+ * which of tiers 1/3 are consulted; recorded (tier 2) and the 404 fallback
+ * are always present. `--mode record` skips both the implementation and
+ * synthetic tiers entirely, giving byte-exact recorded replay when
+ * determinism matters more than coherence. Set MOCK_SYNTHETIC=0 to disable
+ * tier 3 outright regardless of mode.
  */
 
 import * as http from 'http';
@@ -309,8 +318,75 @@ function bestGetMatch(entries: TrafficEntry[], incomingParams: URLSearchParams):
 // ---------------------------------------------------------------------------
 // POST body field matching
 // ---------------------------------------------------------------------------
-function scorePostMatch(capturedPostData: string | null, incomingBody: string): number {
+
+/** True JSON equality for scoring purposes — good enough for the flat
+ * request-body shapes recorded captures actually contain (strings, numbers,
+ * booleans, nested objects/arrays compare by serialized form). */
+function jsonBodyValueEqual(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** Score two parsed JSON bodies by semantic similarity: a key present on
+ * both sides with an equal value scores highest, a key present on both
+ * sides with a differing value scores lower, and a key present on only one
+ * side contributes nothing (lowest tier). Returns null — rather than a low
+ * number — when every key the two bodies have in common disagrees: a
+ * candidate that shares shape with the incoming request but contradicts it
+ * on every field (e.g. an empty-form submission recorded against a real
+ * one) should never be picked as "the" match. Returning nothing is better
+ * than returning a wrong recorded response. */
+function scoreJsonBodyMatch(captured: unknown, incoming: unknown): number | null {
+  if (
+    typeof captured !== 'object' || captured === null || Array.isArray(captured) ||
+    typeof incoming !== 'object' || incoming === null || Array.isArray(incoming)
+  ) {
+    return null;
+  }
+  const capturedObj = captured as Record<string, unknown>;
+  const incomingObj = incoming as Record<string, unknown>;
+  const sharedKeys = Object.keys(incomingObj).filter((k) => k in capturedObj);
+
+  let score = 0;
+  let agreements = 0;
+  for (const k of sharedKeys) {
+    if (jsonBodyValueEqual(capturedObj[k], incomingObj[k])) {
+      score += 3;
+      agreements++;
+    } else {
+      score += 1;
+    }
+  }
+
+  if (sharedKeys.length > 0 && agreements === 0) return null;
+  return score;
+}
+
+/** Returns null for "not a match at all" (see scoreJsonBodyMatch) — distinct
+ * from a merely low score, which still wins if it's the least-bad option. */
+function scorePostMatch(capturedPostData: string | null, incomingBody: string): number | null {
   if (!capturedPostData) return 0;
+
+  // When both sides parse as JSON objects, compare them semantically rather
+  // than falling through to form-encoded scoring below, which would treat
+  // an entire JSON body as one opaque token and can't tell two different
+  // JSON submissions apart (every JSON POST to the same path would score
+  // identically).
+  let incomingJson: unknown;
+  let capturedJson: unknown;
+  try {
+    incomingJson = JSON.parse(incomingBody);
+  } catch {
+    incomingJson = undefined;
+  }
+  try {
+    capturedJson = JSON.parse(capturedPostData);
+  } catch {
+    capturedJson = undefined;
+  }
+  if (incomingJson !== undefined && capturedJson !== undefined) {
+    return scoreJsonBodyMatch(capturedJson, incomingJson);
+  }
+
   try {
     const captured = new URLSearchParams(capturedPostData);
     const incoming = new URLSearchParams(incomingBody);
@@ -325,15 +401,18 @@ function scorePostMatch(capturedPostData: string | null, incomingBody: string): 
   }
 }
 
-function bestPostMatch(entries: TrafficEntry[], incomingBody: string): TrafficEntry {
-  if (entries.length === 1) return entries[0];
-  let best = entries[0];
-  let bestScore = scorePostMatch(entries[0].postData, incomingBody);
-  for (let i = 1; i < entries.length; i++) {
-    const score = scorePostMatch(entries[i].postData, incomingBody);
-    if (score > bestScore) {
+/** Best-scoring recorded entry for a POST, or null when every candidate was
+ * rejected outright (see scorePostMatch) — a caller seeing null should fall
+ * through to the next tier rather than serve a contradicting response. */
+function bestPostMatch(entries: TrafficEntry[], incomingBody: string): TrafficEntry | null {
+  let best: TrafficEntry | null = null;
+  let bestScore = -Infinity;
+  for (const entry of entries) {
+    const score = scorePostMatch(entry.postData, incomingBody);
+    if (score === null) continue;
+    if (best === null || score > bestScore) {
       bestScore = score;
-      best = entries[i];
+      best = entry;
     }
   }
   return best;
@@ -903,52 +982,22 @@ function createServer(
       }
     }
 
-    // ── Route matching (tier 1: recorded — always wins when present) ──────
     const routeKey = `${method} ${pathname}`;
-    const matchedEntries = index.get(routeKey);
 
-    // Read the request body at most once — recorded POST matching, the
-    // implementation tier, and fault injection can all end up wanting it,
-    // and the underlying stream can only be drained a single time.
+    // Read the request body at most once — the implementation tier, recorded
+    // POST matching, and fault injection can all end up wanting it, and the
+    // underlying stream can only be drained a single time.
     let bodyText: string | undefined;
     if (method !== 'GET' && method !== 'HEAD') {
       bodyText = await readBody(req);
     }
 
-    if (matchedEntries && matchedEntries.length > 0) {
-      let entry: TrafficEntry;
-      if (method === 'POST') {
-        entry = bestPostMatch(matchedEntries, bodyText ?? '');
-      } else {
-        entry = bestGetMatch(matchedEntries, parsedUrl.searchParams);
-      }
-
-      rlog(
-        `[mock] ${method} ${pathname} → matched (${matchedEntries.length} candidate(s), status=${entry.status})`
-      );
-
-      // ── Fault injection ─────────────────────────────────────────────────
-      faultStats.totalRequests++;
-
-      if (faultRate > 0 && Math.random() < faultRate) {
-        const fault = pickRandomFault(enabledTypes);
-        await injectFault(fault, entry, res, method, pathname);
-        return;
-      }
-
-      // ── Send recorded response ────────────────────────────────────────
-      res.writeHead(entry.status, {
-        'Content-Type': entry.contentType || 'application/octet-stream',
-        'X-Mockify-Tier': 'recorded',
-      });
-      res.end(entry.responseBody ?? '');
-      return;
-    }
-
-    // ── Tier 2: implementation ──────────────────────────────────────────────
-    // No recorded exchange matches exactly — before falling back to shape
-    // synthesis, ask the generated implementation (src/infer/, `mockify
-    // infer`) if it can produce a real answer from real routing + state.
+    // ── Tier 1: implementation ──────────────────────────────────────────────
+    // Tried first when loaded (auto/impl modes): it's the one tier that can
+    // stay self-consistent across a POST-then-GET sequence (real routing +
+    // an in-memory store), so a state-changing request has to reach it
+    // before anything else gets a chance to answer. Routes it declines
+    // (throw, timeout, explicit null) fall through to the recorded tier.
     if (modeAllowsImpl(mode) && loadedImpl.impl) {
       const query: Record<string, string> = {};
       for (const [k, v] of parsedUrl.searchParams) query[k] = v;
@@ -994,6 +1043,48 @@ function createServer(
           );
         }
       }
+    }
+
+    // ── Tier 2: recorded ──────────────────────────────────────────────────
+    // The implementation tier either wasn't consulted, declined, or isn't
+    // loaded — fall back to an exact recorded request/response match,
+    // scored against query params / POST body.
+    const matchedEntries = index.get(routeKey);
+
+    if (matchedEntries && matchedEntries.length > 0) {
+      let entry: TrafficEntry | null;
+      if (method === 'POST') {
+        entry = bestPostMatch(matchedEntries, bodyText ?? '');
+      } else {
+        entry = bestGetMatch(matchedEntries, parsedUrl.searchParams);
+      }
+
+      if (entry) {
+        rlog(
+          `[mock] ${method} ${pathname} → matched (${matchedEntries.length} candidate(s), status=${entry.status})`
+        );
+
+        // ── Fault injection ───────────────────────────────────────────────
+        faultStats.totalRequests++;
+
+        if (faultRate > 0 && Math.random() < faultRate) {
+          const fault = pickRandomFault(enabledTypes);
+          await injectFault(fault, entry, res, method, pathname);
+          return;
+        }
+
+        // ── Send recorded response ──────────────────────────────────────
+        res.writeHead(entry.status, {
+          'Content-Type': entry.contentType || 'application/octet-stream',
+          'X-Mockify-Tier': 'recorded',
+        });
+        res.end(entry.responseBody ?? '');
+        return;
+      }
+
+      rlog(
+        `[mock] ${method} ${pathname} → ${matchedEntries.length} candidate(s), none matched the request body — falling through`
+      );
     }
 
     // ── Tier 3: synthetic ──────────────────────────────────────────────────
