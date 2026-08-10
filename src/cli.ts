@@ -59,6 +59,10 @@ import { generateSynthetic } from './synthesize/generate.js';
 import { startMockServer } from './mock-server.js';
 import { allocateCaptureDir, listCaptures, resolveCapture, summarizeCapture, type CaptureSummary } from './captures/store.js';
 import type { CapturedTraffic } from './format/types.js';
+import { loadImplementation, ImplementationLoadError } from './infer/contract.js';
+import { splitPairs } from './infer/split.js';
+import { validateImplementation, type Grade, type ValidationResult } from './infer/harness.js';
+import { computeGap, scanForHardcoding } from './infer/hardcoding.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -102,6 +106,7 @@ function printUsage(): void {
   console.error('  replay <name|path> [--port N]                       Replay a saved capture');
   console.error('  serve [--port N] [--data <path>]                    Back-compat alias for replay');
   console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
+  console.error('  validate <name|path> [--impl <path>] [--json]       Grade a generated implementation against a capture (train/holdout + hardcoding check)');
   console.error('  mcp                                                 Start a stdio MCP server exposing capture tools to any MCP-capable agent');
   console.error('');
   console.error('capture options:');
@@ -390,6 +395,164 @@ async function runSynthesize(args: string[]): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// validate — grade a generated implementation against a capture
+// ---------------------------------------------------------------------------
+
+const GRADE_COLUMNS: Grade[] = ['exact', 'structural', 'status_only', 'fail'];
+
+function printGradeSummary(label: string, result: ValidationResult): void {
+  const g = result.overall;
+  console.log(
+    `${label}: ${result.total} pair(s) — exact ${g.exact}, structural ${g.structural}, ` +
+      `status_only ${g.status_only}, fail ${g.fail}`
+  );
+}
+
+function printPerTemplateTable(label: string, result: ValidationResult): void {
+  if (result.perTemplate.length === 0) return;
+  console.log(`${label} per-template breakdown:`);
+  const rows = result.perTemplate.map((t) => ({
+    method: t.method,
+    pathTemplate: t.pathTemplate,
+    pairs: String(t.pairs),
+    ...Object.fromEntries(GRADE_COLUMNS.map((g) => [g, String(t.grades[g])])),
+  }));
+  const headers = ['METHOD', 'TEMPLATE', 'PAIRS', 'EXACT', 'STRUCTURAL', 'STATUS_ONLY', 'FAIL'];
+  const keys = ['method', 'pathTemplate', 'pairs', 'exact', 'structural', 'status_only', 'fail'] as const;
+  const widths = keys.map((k, i) =>
+    Math.max(headers[i].length, ...rows.map((r) => String(r[k as keyof typeof r]).length))
+  );
+  const row = (cells: string[]): string => '  ' + cells.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd();
+  console.log(row(headers));
+  for (const r of rows) {
+    console.log(row(keys.map((k) => String(r[k as keyof typeof r]))));
+  }
+}
+
+async function runValidate(args: string[]): Promise<void> {
+  const usage = 'Usage: mockify validate <name|path> [--impl <path>] [--json]';
+  const nameOrPath = firstPositional(args);
+  if (!nameOrPath) {
+    console.error(usage);
+    process.exit(1);
+    return;
+  }
+
+  let resolved: { name: string; dir: string };
+  try {
+    resolved = resolveCapture(nameOrPath);
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  const implArg = parseFlag(args, '--impl');
+  const implPath = implArg
+    ? path.resolve(process.cwd(), implArg)
+    : path.join(resolved.dir, 'impl', 'handlers.mjs');
+  const jsonOut = hasFlag(args, '--json');
+
+  let impl;
+  try {
+    impl = await loadImplementation(implPath);
+  } catch (err) {
+    if (err instanceof ImplementationLoadError && err.code === 'not_found') {
+      if (jsonOut) {
+        console.log(JSON.stringify({ error: 'no_implementation', implPath }, null, 2));
+      } else {
+        console.error(`No implementation found at ${implPath}.`);
+        console.error('');
+        console.error("This is expected today — mockify doesn't generate implementations yet.");
+        console.error('This command (`mockify validate`) is the measuring instrument for a forthcoming');
+        console.error('`mockify infer` command that will generate one from this capture. Once that');
+        console.error(`exists and writes ${path.join(resolved.dir, 'impl', 'handlers.mjs')},`);
+        console.error('run this command again to grade it.');
+      }
+      process.exit(1);
+      return;
+    }
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  const trafficPath = path.join(resolved.dir, 'traffic.json');
+  const entries = JSON.parse(fs.readFileSync(trafficPath, 'utf8')) as CapturedTraffic[];
+
+  const { train, holdout, counts } = splitPairs(entries);
+  const trainResult = await validateImplementation(impl, train);
+  const holdoutResult = await validateImplementation(impl, holdout);
+  const gap = computeGap(trainResult, holdoutResult);
+
+  const sourceCode = fs.readFileSync(implPath, 'utf8');
+  const capturedResponses = entries.map((e) => e.responseBody ?? '');
+  const scan = scanForHardcoding(sourceCode, capturedResponses);
+
+  if (jsonOut) {
+    console.log(
+      JSON.stringify(
+        {
+          capture: resolved.name,
+          implPath,
+          splitCounts: counts,
+          train: trainResult,
+          holdout: holdoutResult,
+          gap,
+          hardcodingScan: scan,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  console.log(`Validating "${resolved.name}" against ${implPath}`);
+  console.log('');
+  console.log(
+    `Split: ${entries.length} total pair(s) → ${train.length} train, ${holdout.length} holdout ` +
+      `(${counts.length} endpoint template(s))`
+  );
+  console.log('');
+  printGradeSummary('Train', trainResult);
+  printGradeSummary('Holdout', holdoutResult);
+  console.log('');
+
+  if (gap.verdict === 'insufficient_holdout') {
+    console.log('Held-out gap: not enough holdout pairs to compute one.');
+  } else {
+    const trainPct = (gap.trainRate * 100).toFixed(0);
+    const holdoutPct = ((gap.holdoutRate ?? 0) * 100).toFixed(0);
+    const gapPct = ((gap.gap ?? 0) * 100).toFixed(0);
+    const thresholdPct = (gap.threshold * 100).toFixed(0);
+    console.log(
+      `Held-out gap: train=${trainPct}% holdout=${holdoutPct}% gap=${gapPct}pp ` +
+        `(threshold ${thresholdPct}pp) → ${gap.verdict.toUpperCase()}`
+    );
+  }
+  console.log('');
+
+  printPerTemplateTable('Train', trainResult);
+  console.log('');
+  printPerTemplateTable('Holdout', holdoutResult);
+  console.log('');
+
+  console.log(
+    `Hardcoding scan: ${scan.matchedValues}/${scan.totalDistinctiveValues} distinctive captured value(s) ` +
+      `appear verbatim in the implementation source (ratio ${scan.ratio.toFixed(2)})`
+  );
+  if (scan.evidence.length > 0) {
+    console.log('  Some overlap can be legitimate (enum values, field names, correctly-reproduced seed');
+    console.log('  data) — this is evidence to weigh, not a verdict. Top matches:');
+    for (const e of scan.evidence.slice(0, 10)) {
+      const shown = e.value.length > 60 ? `${e.value.slice(0, 57)}...` : e.value;
+      console.log(`    ${e.occurrences}x  "${shown}"`);
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
 
@@ -409,6 +572,9 @@ async function main(): Promise<void> {
       return;
     case 'synthesize':
       await runSynthesize(rest);
+      return;
+    case 'validate':
+      await runValidate(rest);
       return;
     case 'mcp':
       await runMcp();

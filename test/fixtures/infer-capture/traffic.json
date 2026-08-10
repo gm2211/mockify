@@ -1,0 +1,74 @@
+[
+  {
+    "url": "https://fixture.test/api/items",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1000,
+    "responseBody": "[{\"id\":1,\"name\":\"Widget Alpha\",\"description\":\"A sturdy alpha-grade widget rated for industrial vibration testing\"},{\"id\":2,\"name\":\"Widget Beta\",\"description\":\"A lightweight beta widget still undergoing lab experimentation trials\"},{\"id\":3,\"name\":\"Widget Gamma\",\"description\":\"The gamma widget resists corrosion admirably in coastal seawater environments\"},{\"id\":4,\"name\":\"Widget Delta\",\"description\":\"Delta widgets ship pre-assembled directly from the Cascade manufacturing facility\"},{\"id\":5,\"name\":\"Widget Epsilon\",\"description\":\"Epsilon is the specialized export variant sold exclusively in Argentina\"}]"
+  },
+  {
+    "url": "https://fixture.test/api/items/1",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1001,
+    "responseBody": "{\"id\":1,\"name\":\"Widget Alpha\",\"description\":\"A sturdy alpha-grade widget rated for industrial vibration testing\"}"
+  },
+  {
+    "url": "https://fixture.test/api/items/2",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1002,
+    "responseBody": "{\"id\":2,\"name\":\"Widget Beta\",\"description\":\"A lightweight beta widget still undergoing lab experimentation trials\"}"
+  },
+  {
+    "url": "https://fixture.test/api/items/3",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1003,
+    "responseBody": "{\"id\":3,\"name\":\"Widget Gamma\",\"description\":\"The gamma widget resists corrosion admirably in coastal seawater environments\"}"
+  },
+  {
+    "url": "https://fixture.test/api/items/4",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1004,
+    "responseBody": "{\"id\":4,\"name\":\"Widget Delta\",\"description\":\"Delta widgets ship pre-assembled directly from the Cascade manufacturing facility\"}"
+  },
+  {
+    "url": "https://fixture.test/api/items/5",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1005,
+    "responseBody": "{\"id\":5,\"name\":\"Widget Epsilon\",\"description\":\"Epsilon is the specialized export variant sold exclusively in Argentina\"}"
+  },
+  {
+    "url": "https://fixture.test/api/items",
+    "method": "POST",
+    "postData": "{\"name\":\"Widget Zeta\",\"description\":\"Zeta is the newest experimental prototype awaiting certification\"}",
+    "status": 201,
+    "contentType": "application/json",
+    "ts": 1006,
+    "responseBody": "{\"id\":6,\"name\":\"Widget Zeta\",\"description\":\"Zeta is the newest experimental prototype awaiting certification\"}"
+  },
+  {
+    "url": "https://fixture.test/api/items",
+    "method": "POST",
+    "postData": "{\"name\":\"Widget Eta\",\"description\":\"Eta prototypes are reserved for internal quality assurance testing only\"}",
+    "status": 201,
+    "contentType": "application/json",
+    "ts": 1007,
+    "responseBody": "{\"id\":7,\"name\":\"Widget Eta\",\"description\":\"Eta prototypes are reserved for internal quality assurance testing only\"}"
+  }
+]
