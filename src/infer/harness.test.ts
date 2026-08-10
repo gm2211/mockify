@@ -130,6 +130,21 @@ test('validateImplementation: per-template breakdown groups pairs by endpoint te
   assert.equal(result.perTemplate[0].grades.exact, 2);
 });
 
+test('validateImplementation: PairResult carries the actual response for feedback callers (infer/generate.ts)', async () => {
+  const impl: Implementation = {
+    reset() {},
+    handle: () => ({ status: 404, contentType: 'application/json', body: { error: 'nope' } }),
+  };
+  const result = await validateImplementation(impl, [entry()]);
+  assert.deepEqual(result.results[0].response, { status: 404, contentType: 'application/json', body: { error: 'nope' } });
+});
+
+test('validateImplementation: PairResult.response is null for an explicit decline', async () => {
+  const impl: Implementation = { reset() {}, handle: () => null };
+  const result = await validateImplementation(impl, [entry()]);
+  assert.equal(result.results[0].response, null);
+});
+
 test('validateImplementation: an empty pairs list still resets and returns zeroed totals', async () => {
   let resets = 0;
   const impl: Implementation = { reset: () => { resets++; }, handle: () => null };

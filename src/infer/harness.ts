@@ -46,6 +46,16 @@ export interface PairResult {
   grade: Grade;
   /** Set for status_only/fail grades — a short human-readable reason. */
   detail?: string;
+  /**
+   * The actual response handle() produced for this pair (or `null` for an
+   * explicit decline), captured here so a caller building model feedback
+   * (src/infer/generate.ts's buildFailureFeedback) can report "what came
+   * back" without re-invoking handle() against an implementation whose
+   * in-memory state has already moved on to later pairs in the run — a
+   * second call would answer with post-run state, not the state that was
+   * actually graded. Omitted when handle() threw; see `detail` for that case.
+   */
+  response?: HandleResponse | null;
 }
 
 export interface TemplateBreakdown {
@@ -166,7 +176,7 @@ async function gradeOne(impl: Implementation, entry: CapturedTraffic): Promise<P
   }
 
   if (response === null || response === undefined) {
-    return { entry, grade: 'fail', detail: 'handler declined (returned null)' };
+    return { entry, grade: 'fail', detail: 'handler declined (returned null)', response: null };
   }
 
   if (response.status !== entry.status) {
@@ -174,6 +184,7 @@ async function gradeOne(impl: Implementation, entry: CapturedTraffic): Promise<P
       entry,
       grade: 'fail',
       detail: `status mismatch: expected ${entry.status}, got ${response.status}`,
+      response,
     };
   }
 
@@ -181,12 +192,12 @@ async function gradeOne(impl: Implementation, entry: CapturedTraffic): Promise<P
   const actualBody = parseJsonMaybe(response.body);
 
   if (util.isDeepStrictEqual(recordedBody, actualBody)) {
-    return { entry, grade: 'exact' };
+    return { entry, grade: 'exact', response };
   }
   if (sameShape(recordedBody, actualBody)) {
-    return { entry, grade: 'structural' };
+    return { entry, grade: 'structural', response };
   }
-  return { entry, grade: 'status_only', detail: 'status matched but body shape differs' };
+  return { entry, grade: 'status_only', detail: 'status matched but body shape differs', response };
 }
 
 /** Run `impl` against every pair in `pairs`, grading each one. Calls

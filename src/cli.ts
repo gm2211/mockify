@@ -47,6 +47,19 @@
  *     (src/synthesize/generate.ts). Runs automatically after `mockify
  *     capture` too; this is for regenerating on demand (e.g. after hand-
  *     editing traffic.json).
+ *
+ *   mockify infer <name|path> [--rounds N] [--holdout <ratio>] [--json]
+ *     Generates a real mock implementation (src/infer/generate.ts) from a
+ *     capture: an LLM writes `<captureDir>/impl/handlers.mjs` — real
+ *     routing + an in-memory store, not a memorized lookup table — trained
+ *     only on a portion of the capture and iterated against the validation
+ *     harness (src/infer/harness.ts) up to `--rounds` times (default 3).
+ *     The remaining portion (`--holdout`, default 0.2) is never shown to the
+ *     model; it's used once, at the end, to grade the winning attempt and
+ *     detect memorization (src/infer/hardcoding.ts). Writes
+ *     `<captureDir>/impl/report.json` alongside the implementation. Exits
+ *     non-zero if the final implementation fails to load or is flagged
+ *     likely_hardcoded.
  */
 
 import { spawn } from 'node:child_process';
@@ -63,6 +76,7 @@ import { loadImplementation, ImplementationLoadError } from './infer/contract.js
 import { splitPairs } from './infer/split.js';
 import { validateImplementation, type Grade, type ValidationResult } from './infer/harness.js';
 import { computeGap, scanForHardcoding } from './infer/hardcoding.js';
+import { inferImplementation, type InferProgressEvent } from './infer/generate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -82,6 +96,7 @@ function hasFlag(args: string[], flag: string): boolean {
 const VALUE_FLAGS = new Set([
   '--port', '--data', '--output', '--name', '--url',
   '--storage-state', '--save-storage-state', '--timeout',
+  '--impl', '--rounds', '--holdout',
 ]);
 
 /** First argument that isn't a flag or a flag's value. */
@@ -107,6 +122,7 @@ function printUsage(): void {
   console.error('  serve [--port N] [--data <path>]                    Back-compat alias for replay');
   console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
   console.error('  validate <name|path> [--impl <path>] [--json]       Grade a generated implementation against a capture (train/holdout + hardcoding check)');
+  console.error('  infer <name|path> [--rounds N] [--holdout R] [--json]  Generate a real mock implementation from a capture');
   console.error('  mcp                                                 Start a stdio MCP server exposing capture tools to any MCP-capable agent');
   console.error('');
   console.error('capture options:');
@@ -553,6 +569,164 @@ async function runValidate(args: string[]): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// infer — generate a real mock implementation from a capture
+// ---------------------------------------------------------------------------
+
+function onInferProgress(event: InferProgressEvent): void {
+  switch (event.type) {
+    case 'sampling':
+      console.error(
+        `Sampled ${event.templateCount} endpoint template(s), ${event.trainCount} train / ` +
+          `${event.holdoutCount} holdout pair(s) — prompt ${event.promptChars.toLocaleString()} chars ` +
+          `(${event.examplesPerTemplate} example(s)/template, bodies capped at ${event.bodyCharCap} chars)`
+      );
+      break;
+    case 'round_start':
+      console.error(`round ${event.round}/${event.rounds}: generating...`);
+      break;
+    case 'round_generated':
+      console.error(`round ${event.round}: received ${event.sourceChars.toLocaleString()} char(s)`);
+      break;
+    case 'round_load_error':
+      console.error(`round ${event.round}: failed to load — ${event.error}`);
+      break;
+    case 'round_generation_error':
+      console.error(`round ${event.round}: generation failed — ${event.error}`);
+      break;
+    case 'round_scored':
+      console.error(
+        `round ${event.round}: train pass rate ${(event.trainRate * 100).toFixed(0)}% ` +
+          `(exact ${event.overall.exact}, structural ${event.overall.structural}, ` +
+          `status_only ${event.overall.status_only}, fail ${event.overall.fail})`
+      );
+      break;
+    case 'best_selected':
+      console.error(`best attempt: round ${event.round} (train pass rate ${(event.trainRate * 100).toFixed(0)}%)`);
+      break;
+    case 'final_scoring_start':
+      console.error('Scoring the best attempt against holdout...');
+      break;
+    case 'done':
+      break;
+  }
+}
+
+async function runInfer(args: string[]): Promise<void> {
+  const usage = 'Usage: mockify infer <name|path> [--rounds N] [--holdout <ratio>] [--json]';
+  const nameOrPath = firstPositional(args);
+  if (!nameOrPath) {
+    console.error(usage);
+    process.exit(1);
+    return;
+  }
+
+  let resolved: { name: string; dir: string };
+  try {
+    resolved = resolveCapture(nameOrPath);
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  const roundsArg = parseFlag(args, '--rounds');
+  let rounds: number | undefined;
+  if (roundsArg !== undefined) {
+    rounds = Number(roundsArg);
+    if (!Number.isFinite(rounds) || rounds <= 0) {
+      console.error(`error: --rounds must be a positive number, got "${roundsArg}"`);
+      process.exit(1);
+      return;
+    }
+  }
+
+  const holdoutArg = parseFlag(args, '--holdout');
+  let holdoutRatio: number | undefined;
+  if (holdoutArg !== undefined) {
+    holdoutRatio = Number(holdoutArg);
+    if (!Number.isFinite(holdoutRatio) || holdoutRatio <= 0 || holdoutRatio >= 1) {
+      console.error(`error: --holdout must be a ratio between 0 and 1, got "${holdoutArg}"`);
+      process.exit(1);
+      return;
+    }
+  }
+
+  const jsonOut = hasFlag(args, '--json');
+
+  let summary;
+  try {
+    summary = await inferImplementation({
+      captureDir: resolved.dir,
+      rounds,
+      holdoutRatio,
+      onProgress: onInferProgress,
+    });
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  if (jsonOut) {
+    console.log(JSON.stringify(summary, null, 2));
+  } else {
+    console.log('');
+    console.log(
+      `Inferred implementation for "${resolved.name}" (${summary.roundsUsed}/${summary.roundsMax} round(s), ` +
+        `model ${summary.model}, best round ${summary.bestRound})`
+    );
+    console.log('');
+    printGradeSummary('Train', summary.train);
+    printGradeSummary('Holdout', summary.holdout);
+    console.log('');
+
+    if (summary.gap.verdict === 'insufficient_holdout') {
+      console.log('Held-out gap: not enough holdout pairs to compute one.');
+    } else {
+      const trainPct = (summary.gap.trainRate * 100).toFixed(0);
+      const holdoutPct = ((summary.gap.holdoutRate ?? 0) * 100).toFixed(0);
+      const gapPct = ((summary.gap.gap ?? 0) * 100).toFixed(0);
+      const thresholdPct = (summary.gap.threshold * 100).toFixed(0);
+      console.log(
+        `Held-out gap: train=${trainPct}% holdout=${holdoutPct}% gap=${gapPct}pp ` +
+          `(threshold ${thresholdPct}pp) → ${summary.gap.verdict.toUpperCase()}`
+      );
+    }
+    console.log('');
+
+    printPerTemplateTable('Train', summary.train);
+    console.log('');
+    printPerTemplateTable('Holdout', summary.holdout);
+    console.log('');
+
+    console.log(
+      `Hardcoding scan: ${summary.hardcoding.matchedValues}/${summary.hardcoding.totalDistinctiveValues} distinctive ` +
+        `captured value(s) appear verbatim in the implementation source (ratio ${summary.hardcoding.ratio.toFixed(2)})`
+    );
+    if (summary.hardcoding.evidence.length > 0) {
+      for (const e of summary.hardcoding.evidence.slice(0, 10)) {
+        const shown = e.value.length > 60 ? `${e.value.slice(0, 57)}...` : e.value;
+        console.log(`    ${e.occurrences}x  "${shown}"`);
+      }
+    }
+    console.log('');
+
+    console.log(`Implementation: ${summary.implPath}`);
+    console.log(`Report:         ${summary.reportPath}`);
+  }
+
+  if (summary.gap.verdict === 'likely_hardcoded') {
+    console.error('');
+    console.error(
+      'error: the generated implementation is likely hardcoded — it memorized train responses instead of ' +
+        `modeling the API (train/holdout gap ${((summary.gap.gap ?? 0) * 100).toFixed(0)}pp exceeds the ` +
+        `${(summary.gap.threshold * 100).toFixed(0)}pp threshold). Not safe to use.`
+    );
+    process.exit(1);
+  }
+}
+
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
 
@@ -575,6 +749,9 @@ async function main(): Promise<void> {
       return;
     case 'validate':
       await runValidate(rest);
+      return;
+    case 'infer':
+      await runInfer(rest);
       return;
     case 'mcp':
       await runMcp();
