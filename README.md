@@ -59,6 +59,12 @@ X-Mockify-Synthetic: true
 
 `mockify capture` runs synthesis automatically (failures are non-fatal); regenerate by hand with `npx mockify synthesize --data captures/<name>`. `MOCK_SYNTHETIC=0` disables synthesis; `GET /_synthetic` and `GET /_impl` report what's loaded and hit counts for each tier.
 
+## Watching an inferred implementation work
+
+`mockify validate` grades a generated implementation on traffic it never saw during inference — a held-out split, not the training pairs — then the GIF proves the state is real: a message count read before a `POST`, the same `POST` answered by the implementation tier, and the count read again afterward, up by one.
+
+![mockify validate grading a generated implementation's train and held-out pass rates plus a hardcoding scan, a look at the real validateMessage logic it wrote, then a replay where POSTing a message moves /api/message/count from 13 to 14](assets/infer-demo.gif)
+
 ## Replay
 
 ```bash
