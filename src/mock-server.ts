@@ -27,6 +27,8 @@
  *   MOCK_REFRESH_PATH          — cookie refresh endpoint path (default: /auth/refresh)
  *   MOCK_SYNTHETIC             — set to 0 to disable synthetic (generalized) replay (default: on)
  *   MOCK_VERBOSE               — set to 1 to log every request (default: banner + config only)
+ *   MOCKIFY_IMPL_TIMEOUT_MS    — wall-clock budget for a generated implementation's handle() call
+ *                                 before it's treated as hung and skipped (default: 2000)
  *
  * Diagnostic endpoints (no auth required):
  *   GET /           → route index
@@ -34,14 +36,31 @@
  *   GET /_faults    → fault injection state
  *   GET /_sessions  → active sessions
  *   GET /_synthetic → loaded synthetic templates + hit stats
+ *   GET /_impl      → loaded implementation info + report.json summary
  *
- * Requests that don't match a recorded route fall through to synthetic
- * (generalized) replay when `<captureDir>/synthetic/index.json` exists (see
- * src/synthesize/) — a plausible response is generated from the shape of
- * endpoints that WERE recorded, so e.g. `/api/room/7` can succeed even
- * though only rooms 1-3 were ever captured. Recorded exact matches always
- * win over synthetic ones. Set MOCK_SYNTHETIC=0 to disable this and fall
- * straight through to the 404-with-hints behavior instead.
+ * -- Four-tier response pipeline --------------------------------------------
+ * Every response is labeled with `X-Mockify-Tier: recorded|implementation|
+ * synthetic`, first match wins:
+ *
+ *   1. recorded       — an exact recorded request/response match. Always
+ *                        wins when one exists.
+ *   2. implementation — `<captureDir>/impl/handlers.mjs` (see src/infer/),
+ *                        a generated implementation with real routing + an
+ *                        in-memory store. Wrapped in try/catch and a
+ *                        wall-clock timeout (MOCKIFY_IMPL_TIMEOUT_MS); a
+ *                        throw, timeout, or explicit decline (returning
+ *                        null) falls through to the next tier rather than
+ *                        ever 500ing.
+ *   3. synthetic       — shape-based synthesis from OTHER recorded requests
+ *                        that match the same endpoint template (see
+ *                        src/synthesize/), e.g. `/api/room/7` succeeding
+ *                        even though only rooms 1-3 were ever captured.
+ *   4. (none)          — 404 with hints about similar known routes.
+ *
+ * `mockify replay --mode <auto|record|impl|synthetic>` (src/cli.ts) narrows
+ * which of tiers 2/3 are consulted; recorded (tier 1) and the 404 fallback
+ * are always present. Set MOCK_SYNTHETIC=0 to disable tier 3 outright
+ * regardless of mode.
  */
 
 import * as http from 'http';
@@ -56,6 +75,13 @@ import {
   synthesizeResponseBody,
   type SyntheticIndex,
 } from './synthesize/generate.js';
+import {
+  loadImplementation,
+  ImplementationLoadError,
+  type HandleRequest,
+  type HandleResponse,
+  type Implementation,
+} from './infer/contract.js';
 
 // Capture discovery is relative to the current working directory (the
 // directory `mockify serve` is run from), not this module's own location —
@@ -75,6 +101,20 @@ const LOGIN_PATH = (process.env.MOCK_LOGIN_PATH ?? '/login').toLowerCase();
 const POST_LOGIN_REDIRECT = process.env.MOCK_POST_LOGIN_REDIRECT ?? '/';
 const REFRESH_PATH = process.env.MOCK_REFRESH_PATH ?? '/auth/refresh';
 const SYNTHETIC_ENABLED = process.env.MOCK_SYNTHETIC !== '0';
+const IMPL_TIMEOUT_MS = parseInt(process.env.MOCKIFY_IMPL_TIMEOUT_MS ?? '2000', 10);
+
+/** Which tiers `mockify replay --mode` allows the request handler to consult
+ * beyond the always-on recorded tier and the always-on 404 fallback. See the
+ * module doc's "Four-tier response pipeline" section. */
+export type ReplayMode = 'auto' | 'record' | 'impl' | 'synthetic';
+
+function modeAllowsImpl(mode: ReplayMode): boolean {
+  return mode === 'auto' || mode === 'impl';
+}
+
+function modeAllowsSynthetic(mode: ReplayMode): boolean {
+  return mode === 'auto' || mode === 'synthetic';
+}
 
 // ---------------------------------------------------------------------------
 // Session management
@@ -186,7 +226,7 @@ function buildLoginHtml(): string {
 // ---------------------------------------------------------------------------
 // Auth-exempt paths
 // ---------------------------------------------------------------------------
-const AUTH_EXEMPT_PATHS = new Set(['/', '/_traffic', '/_faults', '/_sessions', '/_synthetic']);
+const AUTH_EXEMPT_PATHS = new Set(['/', '/_traffic', '/_faults', '/_sessions', '/_synthetic', '/_impl']);
 // Synthetic login gate is opt-in: most captures replay cleanly without it.
 const AUTH_ENABLED = process.env.MOCK_AUTH === '1';
 
@@ -474,13 +514,13 @@ async function injectFault(
     switch (faultType) {
       case '500': {
         const body = JSON.stringify({ error: true, message: 'Internal server error (fault injection)' });
-        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8', 'X-Mockify-Tier': 'recorded' });
         res.end(body);
         resolve();
         break;
       }
       case '302': {
-        res.writeHead(302, { Location: LOGIN_PATH, 'Content-Length': '0' });
+        res.writeHead(302, { Location: LOGIN_PATH, 'Content-Length': '0', 'X-Mockify-Tier': 'recorded' });
         res.end();
         resolve();
         break;
@@ -491,6 +531,7 @@ async function injectFault(
         setTimeout(() => {
           res.writeHead(entry.status, {
             'Content-Type': entry.contentType || 'application/octet-stream',
+            'X-Mockify-Tier': 'recorded',
           });
           res.end(entry.responseBody ?? '');
           resolve();
@@ -498,7 +539,7 @@ async function injectFault(
         break;
       }
       case 'empty': {
-        res.writeHead(200, { 'Content-Type': entry.contentType || 'application/octet-stream' });
+        res.writeHead(200, { 'Content-Type': entry.contentType || 'application/octet-stream', 'X-Mockify-Tier': 'recorded' });
         res.end('');
         resolve();
         break;
@@ -506,7 +547,7 @@ async function injectFault(
       case 'malformed': {
         const raw = entry.responseBody ?? '{}';
         const cutPoint = Math.max(1, Math.floor(raw.length / 2));
-        res.writeHead(200, { 'Content-Type': entry.contentType || 'application/octet-stream' });
+        res.writeHead(200, { 'Content-Type': entry.contentType || 'application/octet-stream', 'X-Mockify-Tier': 'recorded' });
         res.end(raw.slice(0, cutPoint));
         resolve();
         break;
@@ -520,6 +561,138 @@ async function injectFault(
 }
 
 // ---------------------------------------------------------------------------
+// Implementation tier (src/infer/contract.ts) — loading, timeout, headers
+// ---------------------------------------------------------------------------
+
+/** Minimal shape this module reads out of `<implDir>/report.json` (written
+ * by `mockify infer`, src/infer/generate.ts's buildReport/InferSummary) for
+ * the `/_impl` diagnostic endpoint and the `mockify replay` banner. Declared
+ * locally — and loosely, with every field optional — rather than imported
+ * from src/infer/generate.ts, so the replay hot path never pulls in that
+ * module's Agent SDK dependency just to describe a JSON file that may not
+ * even exist yet. */
+export interface ImplReportSummary {
+  model?: string;
+  generatedAt?: string;
+  roundsUsed?: number;
+  roundsMax?: number;
+  train?: { overall?: Record<string, number>; total?: number };
+  holdout?: { overall?: Record<string, number>; total?: number };
+  gap?: {
+    trainRate?: number;
+    holdoutRate?: number | null;
+    gap?: number | null;
+    verdict?: 'likely_hardcoded' | 'ok' | 'insufficient_holdout';
+    threshold?: number;
+  };
+}
+
+export interface LoadedImplementation {
+  /** Resolved path handlers.mjs was loaded from (or would be loaded from). */
+  implPath: string;
+  /** The loaded module, or null if nothing is loaded (not found, or failed
+   * to load/validate — see `loadError` for the latter case). */
+  impl: Implementation | null;
+  /** Set when a file exists at implPath but failed to load or didn't satisfy
+   * the contract. Left unset for the ordinary "nothing generated yet" case
+   * (ImplementationLoadError code 'not_found') — that's expected, not an
+   * error worth surfacing. */
+  loadError: string | null;
+  /** Parsed `<dirname(implPath)>/report.json`, if present and parseable. */
+  report: ImplReportSummary | null;
+}
+
+function loadReportSummary(implPath: string): ImplReportSummary | null {
+  const reportPath = path.join(path.dirname(implPath), 'report.json');
+  if (!fs.existsSync(reportPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(reportPath, 'utf-8')) as ImplReportSummary;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve + load the implementation module (default `<captureDir>/impl/
+ * handlers.mjs`, or `implPathOverride` — `mockify replay --impl <path>`).
+ * Always attempts the load regardless of `--mode`, so `/_impl` and the
+ * replay banner can report accurate diagnostics even in a mode that doesn't
+ * consult the implementation tier at request time; the mode only gates
+ * whether the request handler ever calls `impl.handle()`. Never throws —
+ * "nothing generated yet" and "found something broken" both resolve to a
+ * `LoadedImplementation` a caller can branch on. */
+async function loadImplementationForServer(
+  captureDir: string,
+  implPathOverride: string | undefined
+): Promise<LoadedImplementation> {
+  const implPath = implPathOverride
+    ? path.resolve(implPathOverride)
+    : path.join(captureDir, 'impl', 'handlers.mjs');
+
+  try {
+    const impl = await loadImplementation(implPath);
+    return { implPath, impl, loadError: null, report: loadReportSummary(implPath) };
+  } catch (err) {
+    if (err instanceof ImplementationLoadError && err.code === 'not_found') {
+      return { implPath, impl: null, loadError: null, report: null };
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return { implPath, impl: null, loadError: message, report: loadReportSummary(implPath) };
+  }
+}
+
+/** Flatten Node's `IncomingHttpHeaders` (string | string[] | undefined per
+ * key) into the flat string map the Implementation contract expects.
+ * Multi-value headers join with ", " (the same convention HTTP itself uses
+ * for repeated headers folded into one line). */
+function flattenHeaders(headers: http.IncomingHttpHeaders): Record<string, string> {
+  const flat: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    flat[key] = Array.isArray(value) ? value.join(', ') : value;
+  }
+  return flat;
+}
+
+type ImplCallOutcome =
+  | { outcome: 'answered'; response: HandleResponse }
+  | { outcome: 'declined' }
+  | { outcome: 'threw'; error: string }
+  | { outcome: 'timed_out' };
+
+/** Call `impl.handle(req)` under a wall-clock budget, converting every way
+ * it can fail to answer (throw, timeout, explicit `null` decline) into a
+ * plain outcome the request handler can fall through on — a generated
+ * implementation must never be able to hang or crash the replay server. The
+ * timed-out call is abandoned, not cancelled (there's no way to cancel a
+ * plain Promise); its `.catch` here exists solely to keep a late
+ * rejection from surfacing as an unhandled rejection after the response
+ * has already moved on to the next tier. */
+async function callImplementation(impl: Implementation, req: HandleRequest, timeoutMs: number): Promise<ImplCallOutcome> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<ImplCallOutcome>((resolve) => {
+    timer = setTimeout(() => resolve({ outcome: 'timed_out' }), timeoutMs);
+  });
+
+  const run: Promise<ImplCallOutcome> = (async () => {
+    try {
+      const response = await impl.handle(req);
+      return response === null || response === undefined ? { outcome: 'declined' } : { outcome: 'answered', response };
+    } catch (err) {
+      return { outcome: 'threw', error: err instanceof Error ? err.message : String(err) };
+    }
+  })();
+  run.catch(() => {
+    // Never reached in practice — the try/catch above already converts every
+    // rejection into a resolved outcome — but this keeps that guarantee from
+    // becoming an unhandled-rejection footgun if it's ever loosened.
+  });
+
+  const result = await Promise.race([run, timeout]);
+  clearTimeout(timer!);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 const { faultRate, enabledTypes } = parseFaultConfig();
@@ -529,16 +702,30 @@ interface SyntheticStats {
   hits: number;
 }
 
+interface ImplStats {
+  hits: number;
+  declines: number;
+  throws: number;
+  timeouts: number;
+}
+
 function createServer(
   entries: TrafficEntry[],
   index: RouteIndex,
-  synthetic: SyntheticIndex | null
+  synthetic: SyntheticIndex | null,
+  mode: ReplayMode,
+  loadedImpl: LoadedImplementation
 ): http.Server {
   const loginHtml = buildLoginHtml();
   const syntheticStats: SyntheticStats = {
     templatesLoaded: synthetic?.templates.length ?? 0,
     hits: 0,
   };
+  const implStats: ImplStats = { hits: 0, declines: 0, throws: 0, timeouts: 0 };
+  // "log once per path" (see the module doc's implementation-tier section):
+  // a generated implementation that throws or hangs on one route shouldn't
+  // spam the log on every subsequent request to that same route.
+  const implWarnedPaths = new Set<string>();
 
   return http.createServer(async (req, res) => {
     const method = (req.method ?? 'GET').toUpperCase();
@@ -687,6 +874,25 @@ function createServer(
       return;
     }
 
+    if (method === 'GET' && pathname === '/_impl') {
+      const body = JSON.stringify(
+        {
+          enabled: modeAllowsImpl(mode),
+          loaded: loadedImpl.impl !== null,
+          path: loadedImpl.implPath,
+          loadError: loadedImpl.loadError,
+          report: loadedImpl.report,
+          stats: implStats,
+        },
+        null,
+        2
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(body);
+      rlog(`[mock] GET /_impl → loaded=${loadedImpl.impl !== null} path=${loadedImpl.implPath}`);
+      return;
+    }
+
     // ── Auth enforcement (opt-in via MOCK_AUTH=1) ─────────────────────────
     if (AUTH_ENABLED && !AUTH_EXEMPT_PATHS.has(pathname)) {
       const session = findValidSession(req);
@@ -697,82 +903,141 @@ function createServer(
       }
     }
 
-    // ── Route matching ────────────────────────────────────────────────────
+    // ── Route matching (tier 1: recorded — always wins when present) ──────
     const routeKey = `${method} ${pathname}`;
     const matchedEntries = index.get(routeKey);
 
-    if (!matchedEntries || matchedEntries.length === 0) {
-      // ── Synthetic fallback ────────────────────────────────────────────
-      // No recorded exchange matches exactly — before giving up, see if this
-      // request fits an endpoint template inferred from OTHER recorded
-      // requests (e.g. /api/room/7 when only /api/room/1..3 were captured).
-      if (SYNTHETIC_ENABLED && synthetic) {
-        const match = matchSyntheticTemplate(synthetic.templates, method, pathname);
-        if (match) {
-          syntheticStats.hits++;
-          const body = synthesizeResponseBody(match.template, match.params, method, pathname);
-          const responseBody =
-            typeof body === 'string' ? body : JSON.stringify(body);
-          res.writeHead(match.template.status, {
-            'Content-Type': match.template.contentType || 'application/octet-stream',
-            'X-Mockify-Synthetic': 'true',
-          });
-          res.end(responseBody);
-          rlog(
-            `[mock] SYNTH ${method} ${pathname} ← ${match.template.pathTemplate}`
-          );
-          return;
-        }
+    // Read the request body at most once — recorded POST matching, the
+    // implementation tier, and fault injection can all end up wanting it,
+    // and the underlying stream can only be drained a single time.
+    let bodyText: string | undefined;
+    if (method !== 'GET' && method !== 'HEAD') {
+      bodyText = await readBody(req);
+    }
+
+    if (matchedEntries && matchedEntries.length > 0) {
+      let entry: TrafficEntry;
+      if (method === 'POST') {
+        entry = bestPostMatch(matchedEntries, bodyText ?? '');
+      } else {
+        entry = bestGetMatch(matchedEntries, parsedUrl.searchParams);
       }
 
-      const similar = Array.from(index.keys())
-        .filter((k) => k.includes(pathname.split('/').slice(0, 3).join('/')))
-        .sort();
-
-      const body = JSON.stringify(
-        {
-          error: 'No matching route',
-          requested: `${method} ${pathname}`,
-          hint: 'Check GET / for all available routes',
-          similar: similar.length > 0 ? similar : undefined,
-        },
-        null,
-        2
+      rlog(
+        `[mock] ${method} ${pathname} → matched (${matchedEntries.length} candidate(s), status=${entry.status})`
       );
-      res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(body);
-      rlog(`[mock] 404 ${method} ${pathname} (no match)`);
+
+      // ── Fault injection ─────────────────────────────────────────────────
+      faultStats.totalRequests++;
+
+      if (faultRate > 0 && Math.random() < faultRate) {
+        const fault = pickRandomFault(enabledTypes);
+        await injectFault(fault, entry, res, method, pathname);
+        return;
+      }
+
+      // ── Send recorded response ────────────────────────────────────────
+      res.writeHead(entry.status, {
+        'Content-Type': entry.contentType || 'application/octet-stream',
+        'X-Mockify-Tier': 'recorded',
+      });
+      res.end(entry.responseBody ?? '');
       return;
     }
 
-    // ── Pick best match ───────────────────────────────────────────────────
-    let entry: TrafficEntry;
+    // ── Tier 2: implementation ──────────────────────────────────────────────
+    // No recorded exchange matches exactly — before falling back to shape
+    // synthesis, ask the generated implementation (src/infer/, `mockify
+    // infer`) if it can produce a real answer from real routing + state.
+    if (modeAllowsImpl(mode) && loadedImpl.impl) {
+      const query: Record<string, string> = {};
+      for (const [k, v] of parsedUrl.searchParams) query[k] = v;
 
-    if (method === 'POST') {
-      const body = await readBody(req);
-      entry = bestPostMatch(matchedEntries, body);
-    } else {
-      entry = bestGetMatch(matchedEntries, parsedUrl.searchParams);
+      const outcome = await callImplementation(
+        loadedImpl.impl,
+        { method, path: pathname, query, headers: flattenHeaders(req.headers), body: bodyText },
+        IMPL_TIMEOUT_MS
+      );
+
+      if (outcome.outcome === 'answered') {
+        implStats.hits++;
+        const { response } = outcome;
+        const responseBody = typeof response.body === 'string' ? response.body : JSON.stringify(response.body);
+        res.writeHead(response.status, {
+          'Content-Type': response.contentType || 'application/octet-stream',
+          'X-Mockify-Tier': 'implementation',
+        });
+        res.end(responseBody);
+        rlog(`[mock] IMPL ${method} ${pathname} → ${response.status}`);
+        return;
+      }
+
+      if (outcome.outcome === 'declined') {
+        implStats.declines++;
+        rlog(`[mock] IMPL ${method} ${pathname} → declined, falling through`);
+      } else if (outcome.outcome === 'threw') {
+        implStats.throws++;
+        if (!implWarnedPaths.has(routeKey)) {
+          implWarnedPaths.add(routeKey);
+          rlog(
+            `[mock] IMPL ${method} ${pathname} → threw: ${outcome.error} — falling through ` +
+              `(further failures on this route are logged once)`
+          );
+        }
+      } else {
+        implStats.timeouts++;
+        if (!implWarnedPaths.has(routeKey)) {
+          implWarnedPaths.add(routeKey);
+          rlog(
+            `[mock] IMPL ${method} ${pathname} → timed out after ${IMPL_TIMEOUT_MS}ms — falling through ` +
+              `(further failures on this route are logged once; override with MOCKIFY_IMPL_TIMEOUT_MS)`
+          );
+        }
+      }
     }
 
-    rlog(
-      `[mock] ${method} ${pathname} → matched (${matchedEntries.length} candidate(s), status=${entry.status})`
+    // ── Tier 3: synthetic ──────────────────────────────────────────────────
+    // Still nothing — see if this request fits an endpoint template inferred
+    // from OTHER recorded requests (e.g. /api/room/7 when only rooms 1-3
+    // were ever captured).
+    if (modeAllowsSynthetic(mode) && SYNTHETIC_ENABLED && synthetic) {
+      const match = matchSyntheticTemplate(synthetic.templates, method, pathname);
+      if (match) {
+        syntheticStats.hits++;
+        const body = synthesizeResponseBody(match.template, match.params, method, pathname);
+        const responseBody =
+          typeof body === 'string' ? body : JSON.stringify(body);
+        res.writeHead(match.template.status, {
+          'Content-Type': match.template.contentType || 'application/octet-stream',
+          'X-Mockify-Synthetic': 'true',
+          'X-Mockify-Tier': 'synthetic',
+        });
+        res.end(responseBody);
+        rlog(
+          `[mock] SYNTH ${method} ${pathname} ← ${match.template.pathTemplate}`
+        );
+        return;
+      }
+    }
+
+    // ── Tier 4: 404 ────────────────────────────────────────────────────────
+    const similar = Array.from(index.keys())
+      .filter((k) => k.includes(pathname.split('/').slice(0, 3).join('/')))
+      .sort();
+
+    const body = JSON.stringify(
+      {
+        error: 'No matching route',
+        requested: `${method} ${pathname}`,
+        hint: 'Check GET / for all available routes',
+        similar: similar.length > 0 ? similar : undefined,
+      },
+      null,
+      2
     );
-
-    // ── Fault injection ───────────────────────────────────────────────────
-    faultStats.totalRequests++;
-
-    if (faultRate > 0 && Math.random() < faultRate) {
-      const fault = pickRandomFault(enabledTypes);
-      await injectFault(fault, entry, res, method, pathname);
-      return;
-    }
-
-    // ── Send response ─────────────────────────────────────────────────────
-    res.writeHead(entry.status, {
-      'Content-Type': entry.contentType || 'application/octet-stream',
-    });
-    res.end(entry.responseBody ?? '');
+    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(body);
+    rlog(`[mock] 404 ${method} ${pathname} (no match)`);
   });
 }
 
@@ -791,6 +1056,14 @@ export interface StartMockServerOptions {
   /** Suppress the server's own startup/config lines. Callers that print their
    * own banner (`mockify replay`) set this; MOCK_VERBOSE=1 overrides it. */
   quiet?: boolean;
+  /** Which of the implementation/synthetic tiers the request handler may
+   * consult beyond the always-on recorded tier and 404 fallback. Default
+   * `'auto'` — the full four-tier pipeline (see module doc). */
+  mode?: ReplayMode;
+  /** Override the implementation module path instead of the default
+   * `<captureDir>/impl/handlers.mjs` — `mockify replay --impl <path>`, and
+   * how tests exercise a fixture implementation without moving files. */
+  implPath?: string;
 }
 
 export interface StartedMockServer {
@@ -802,6 +1075,11 @@ export interface StartedMockServer {
   /** Number of distinct recorded routes (method+path) served — see route index at GET /. */
   routeCount: number;
   syntheticTemplateCount: number;
+  mode: ReplayMode;
+  /** Diagnostics for the implementation tier — mirrors what GET /_impl
+   * reports, so `mockify replay`'s banner can be built from the same data
+   * without a second file read. */
+  implementation: LoadedImplementation;
 }
 
 /**
@@ -812,15 +1090,19 @@ export interface StartedMockServer {
  * long-standing direct-execution invocations keep working unchanged.
  * Resolves once the server is actually listening.
  */
-export function startMockServer(opts: StartMockServerOptions = {}): Promise<StartedMockServer> {
+export async function startMockServer(opts: StartMockServerOptions = {}): Promise<StartedMockServer> {
   const port = opts.port ?? DEFAULT_PORT;
+  const mode: ReplayMode = opts.mode ?? 'auto';
   // `mockify replay` prints its own banner from the resolved StartedMockServer,
   // so it asks for silence here rather than having its banner buried under a
   // dozen internal config lines. MOCK_VERBOSE=1 overrides.
   const slog = opts.quiet && !VERBOSE ? () => {} : (m: string) => console.error(m);
   const { entries, index, captureDir } = loadTraffic(opts.dataPath, opts.quiet && !VERBOSE);
-  const synthetic = SYNTHETIC_ENABLED ? loadSyntheticIndex(captureDir) : null;
-  if (SYNTHETIC_ENABLED) {
+
+  const synthetic = SYNTHETIC_ENABLED && modeAllowsSynthetic(mode) ? loadSyntheticIndex(captureDir) : null;
+  if (!modeAllowsSynthetic(mode)) {
+    slog(`[mock] Synthetic tier not consulted (--mode ${mode})`);
+  } else if (SYNTHETIC_ENABLED) {
     if (synthetic) {
       rlog(`[mock] Loaded ${synthetic.templates.length} synthetic templates`);
     } else {
@@ -832,7 +1114,26 @@ export function startMockServer(opts: StartMockServerOptions = {}): Promise<Star
     slog('[mock] Synthetic replay disabled (MOCK_SYNTHETIC=0)');
   }
 
-  const server = createServer(entries, index, synthetic);
+  // Loaded unconditionally (mode only gates whether the request handler
+  // consults it) so GET /_impl and the replay banner report accurate
+  // diagnostics no matter which mode is active.
+  const loadedImpl = await loadImplementationForServer(captureDir, opts.implPath);
+  if (!modeAllowsImpl(mode)) {
+    slog(`[mock] Implementation tier not consulted (--mode ${mode})`);
+  } else if (loadedImpl.impl) {
+    slog(`[mock] Loaded implementation from ${loadedImpl.implPath}`);
+  } else if (loadedImpl.loadError) {
+    slog(`[mock] Implementation at ${loadedImpl.implPath} failed to load: ${loadedImpl.loadError}`);
+  } else {
+    slog(
+      `[mock] No implementation found at ${loadedImpl.implPath} (run "mockify infer" to generate one)`
+    );
+  }
+  if (loadedImpl.impl) {
+    await loadedImpl.impl.reset();
+  }
+
+  const server = createServer(entries, index, synthetic, mode, loadedImpl);
 
   return new Promise((resolve) => {
     server.listen(port, () => {
@@ -842,6 +1143,7 @@ export function startMockServer(opts: StartMockServerOptions = {}): Promise<Star
       slog(`[mock] GET http://localhost:${port}/_faults    → fault injection state`);
       slog(`[mock] GET http://localhost:${port}/_sessions  → active sessions`);
       slog(`[mock] GET http://localhost:${port}/_synthetic → loaded synthetic templates`);
+      slog(`[mock] GET http://localhost:${port}/_impl      → loaded implementation info`);
       slog(`[mock] Auth: POST http://localhost:${port}${LOGIN_PATH}  → create session`);
       slog(`[mock] Auth: GET  http://localhost:${port}${REFRESH_PATH}  → extend session`);
       slog(`[mock] Session cookie: "${SESSION_COOKIE_NAME}", TTL: ${SESSION_TTL_MS / 1000}s`);
@@ -857,6 +1159,8 @@ export function startMockServer(opts: StartMockServerOptions = {}): Promise<Star
         entryCount: entries.length,
         routeCount: index.size,
         syntheticTemplateCount: synthetic?.templates.length ?? 0,
+        mode,
+        implementation: loadedImpl,
       });
     });
   });

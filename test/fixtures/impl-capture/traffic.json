@@ -1,0 +1,11 @@
+[
+  {
+    "url": "https://fixture.test/api/items",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1000,
+    "responseBody": "[{\"id\":1,\"name\":\"RECORDED Widget Alpha\",\"description\":\"this literal recorded body must win over the implementation tier, which would answer differently\"}]"
+  }
+]

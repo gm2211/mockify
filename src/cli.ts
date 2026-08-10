@@ -69,7 +69,7 @@ import * as path from 'node:path';
 import { runCaptureAgent } from './agent/runner.js';
 import { resolveStorageStateInput } from './agent/storage-state.js';
 import { generateSynthetic } from './synthesize/generate.js';
-import { startMockServer } from './mock-server.js';
+import { startMockServer, type ReplayMode } from './mock-server.js';
 import { allocateCaptureDir, listCaptures, resolveCapture, summarizeCapture, type CaptureSummary } from './captures/store.js';
 import type { CapturedTraffic } from './format/types.js';
 import { loadImplementation, ImplementationLoadError } from './infer/contract.js';
@@ -96,7 +96,7 @@ function hasFlag(args: string[], flag: string): boolean {
 const VALUE_FLAGS = new Set([
   '--port', '--data', '--output', '--name', '--url',
   '--storage-state', '--save-storage-state', '--timeout',
-  '--impl', '--rounds', '--holdout',
+  '--impl', '--rounds', '--holdout', '--mode',
 ]);
 
 /** First argument that isn't a flag or a flag's value. */
@@ -118,12 +118,20 @@ function printUsage(): void {
   console.error('Commands:');
   console.error('  capture --url <url> [options]                       Record traffic from a live site (agent-driven by default)');
   console.error('  list [--json]                                       List saved captures');
-  console.error('  replay <name|path> [--port N]                       Replay a saved capture');
+  console.error('  replay <name|path> [--port N] [--mode M] [--impl <path>]  Replay a saved capture');
   console.error('  serve [--port N] [--data <path>]                    Back-compat alias for replay');
   console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
   console.error('  validate <name|path> [--impl <path>] [--json]       Grade a generated implementation against a capture (train/holdout + hardcoding check)');
   console.error('  infer <name|path> [--rounds N] [--holdout R] [--json]  Generate a real mock implementation from a capture');
   console.error('  mcp                                                 Start a stdio MCP server exposing capture tools to any MCP-capable agent');
+  console.error('');
+  console.error('replay options:');
+  console.error('  --mode <auto|record|impl|synthetic>  Which tiers to consult beyond recorded (default: auto — all tiers)');
+  console.error('                                  auto:      recorded → implementation → synthetic');
+  console.error('                                  record:    recorded only, then 404 (exact-replay for regression tests)');
+  console.error('                                  impl:      recorded → implementation, then 404 (no shape synthesis)');
+  console.error('                                  synthetic: recorded → synthesis, then 404 (skip a misbehaving implementation)');
+  console.error('  --impl <path>                  Override the implementation module (default: <capture>/impl/handlers.mjs)');
   console.error('');
   console.error('capture options:');
   console.error('  --name <name>                  Name to save the capture under (default: slugified from the URL)');
@@ -162,8 +170,40 @@ async function runServe(args: string[]): Promise<void> {
   });
 }
 
+const REPLAY_MODES: ReplayMode[] = ['auto', 'record', 'impl', 'synthetic'];
+
+function parseMode(raw: string | undefined, usage: string): ReplayMode {
+  if (raw === undefined) return 'auto';
+  if (!REPLAY_MODES.includes(raw as ReplayMode)) {
+    console.error(`error: --mode must be one of ${REPLAY_MODES.join(', ')}, got "${raw}"`);
+    console.error(usage);
+    process.exit(1);
+  }
+  return raw as ReplayMode;
+}
+
+/** Human-readable tier chain for the replay banner — see mock-server.ts's
+ * module doc ("Four-tier response pipeline") for what each mode actually
+ * gates. */
+function tierChain(mode: ReplayMode): string {
+  switch (mode) {
+    case 'auto':
+      return 'recorded → implementation → synthetic';
+    case 'record':
+      return 'recorded only';
+    case 'impl':
+      return 'recorded → implementation';
+    case 'synthetic':
+      return 'recorded → synthetic';
+  }
+}
+
+function formatPct(rate: number | null | undefined): string {
+  return rate === null || rate === undefined ? 'n/a' : `${(rate * 100).toFixed(0)}%`;
+}
+
 async function runReplay(args: string[]): Promise<void> {
-  const usage = 'Usage: mockify replay <name|path> [--port N]';
+  const usage = 'Usage: mockify replay <name|path> [--port N] [--mode auto|record|impl|synthetic] [--impl <path>]';
   const nameOrPath = firstPositional(args);
   if (!nameOrPath) {
     console.error(usage);
@@ -181,13 +221,48 @@ async function runReplay(args: string[]): Promise<void> {
   }
 
   const port = parsePort(parseFlag(args, '--port'), usage);
-  const started = await startMockServer({ dataPath: resolved.dir, port, quiet: true });
+  const mode = parseMode(parseFlag(args, '--mode'), usage);
+  const implArg = parseFlag(args, '--impl');
+  const implPath = implArg ? path.resolve(process.cwd(), implArg) : undefined;
+
+  const started = await startMockServer({ dataPath: resolved.dir, port, quiet: true, mode, implPath });
 
   const summary = summarizeCapture(resolved.name, resolved.dir);
 
   console.error('');
   console.error(`Replaying "${resolved.name}"${summary?.target ? ` → ${summary.target}` : ''}`);
   console.error(`  ${started.routeCount} recorded route(s), ${started.syntheticTemplateCount} synthetic template(s)`);
+  console.error(`  tiers: ${tierChain(started.mode)}`);
+
+  const implActive = started.mode === 'auto' || started.mode === 'impl';
+  if (implActive && started.implementation.impl) {
+    const report = started.implementation.report;
+    if (report?.gap) {
+      console.error(
+        `  implementation: ${started.implementation.implPath} ` +
+          `(train ${formatPct(report.gap.trainRate)} / holdout ${formatPct(report.gap.holdoutRate)} pass rate, ` +
+          `gap verdict: ${report.gap.verdict ?? 'unknown'})`
+      );
+      if (report.gap.verdict === 'likely_hardcoded') {
+        console.error('');
+        console.error(
+          '  ⚠ WARNING: this implementation is flagged likely_hardcoded (see impl/report.json) — it may have'
+        );
+        console.error(
+          '    memorized training responses instead of modeling the API. Consider `--mode synthetic` to bypass'
+        );
+        console.error('    it, or re-run `mockify infer` for a better attempt.');
+        console.error('');
+      }
+    } else {
+      console.error(`  implementation: ${started.implementation.implPath} (no impl/report.json quality summary found)`);
+    }
+  } else if (implActive && started.implementation.loadError) {
+    console.error(
+      `  implementation: FAILED to load from ${started.implementation.implPath} — ${started.implementation.loadError}`
+    );
+  }
+
   console.error(`  → http://localhost:${started.port}`);
 }
 
