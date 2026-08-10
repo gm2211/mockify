@@ -23,13 +23,12 @@ function tempCaptureDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mockify-synth-'));
 }
 
-test('generateSynthetic: writes index.json and examples.json under <captureDir>/synthetic', () => {
+test('generateSynthetic: writes index.json under <captureDir>/synthetic', () => {
   const entries = loadFixtureEntries();
   const dir = tempCaptureDir();
   const summary = generateSynthetic(entries, dir);
 
   assert.ok(fs.existsSync(summary.indexPath));
-  assert.ok(fs.existsSync(summary.examplesPath));
   assert.equal(summary.indexPath, path.join(dir, 'synthetic', 'index.json'));
 
   const index = JSON.parse(fs.readFileSync(summary.indexPath, 'utf8'));
@@ -38,10 +37,6 @@ test('generateSynthetic: writes index.json and examples.json under <captureDir>/
   assert.ok(Array.isArray(index.templates));
   assert.ok(index.templates.some((t: { pathTemplate: string }) => t.pathTemplate === '/api/widgets/{p2}'));
 
-  const examples = JSON.parse(fs.readFileSync(summary.examplesPath, 'utf8'));
-  assert.ok(examples['GET /api/widgets/{p2}']);
-  assert.ok(examples['GET /api/widgets/{p2}'].length > 0);
-  assert.ok(examples['GET /api/widgets/{p2}'].length <= 3);
 });
 
 test('loadSyntheticIndex: round-trips what generateSynthetic wrote', () => {

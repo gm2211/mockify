@@ -31,8 +31,7 @@ captures/demo-grok/
 ├── observations.json   # what the agent saw and decided at each step
 ├── manifest.json       # session metadata: target URL, counts, timestamp
 └── synthetic/
-    ├── index.json        # inferred endpoint templates + response shapes (loaded at replay)
-    └── examples.json      # the same templates, human-readable (never read at runtime)
+    └── index.json       # inferred endpoint templates + response shapes (loaded at replay)
 ```
 
 ## Expansion

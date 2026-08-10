@@ -43,7 +43,7 @@
  *
  *   mockify synthesize --data <captureDir>
  *     Infers endpoint templates + response shapes from a capture's
- *     traffic.json and writes <captureDir>/synthetic/{index,examples}.json
+ *     traffic.json and writes <captureDir>/synthetic/index.json
  *     (src/synthesize/generate.ts). Runs automatically after `mockify
  *     capture` too; this is for regenerating on demand (e.g. after hand-
  *     editing traffic.json).
@@ -384,7 +384,6 @@ async function runSynthesize(args: string[]): Promise<void> {
 
   console.error(`Synthesized ${summary.templateCount} endpoint template(s) from ${entries.length} traffic entries`);
   console.error(`  → ${summary.indexPath}`);
-  console.error(`  → ${summary.examplesPath}`);
   for (const t of summary.templates) {
     const params = t.paramNames.length > 0 ? ` (params: ${t.paramNames.join(', ')})` : '';
     console.error(`  ${t.method.padEnd(6)} ${t.pathTemplate}${params} — ${t.entryCount} sample(s)`);

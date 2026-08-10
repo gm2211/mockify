@@ -4,10 +4,8 @@
  * mock server uses to answer requests that were never recorded.
  *
  * Output layout (written under `<captureDir>/synthetic/`):
- *   index.json    — { version, generatedFrom, templates: [...+ shape] },
- *                    loaded by mock-server.ts at startup.
- *   examples.json — 2-3 concrete synthesized examples per template, for
- *                    humans to sanity-check; never read at runtime.
+ *   index.json — { version, generatedFrom, templates: [...+ shape] },
+ *                loaded by mock-server.ts at startup.
  */
 
 import * as fs from 'fs';
@@ -36,7 +34,6 @@ export interface SyntheticIndex {
 export interface GenerateSummary {
   outDir: string;
   indexPath: string;
-  examplesPath: string;
   templateCount: number;
   templates: Array<{ method: string; pathTemplate: string; paramNames: string[]; entryCount: number }>;
 }
@@ -63,55 +60,14 @@ function buildResolvedPath(template: EndpointTemplate, capturedValues: string[])
   return '/' + resolved.join('/');
 }
 
-interface SynthExample {
-  request: string;
-  response: unknown;
-}
-
-/** Build up to 3 human-inspectable examples per template. For parameterized
- * templates, walk the observed param values (already deduped/capped by
- * templates.ts) so examples use real captured ids; for literal templates
- * (no params), vary the seed so pool-backed fields (e.g. a fluctuating
- * `count`) still show their range. */
-function buildExamples(template: EndpointTemplate, shape: Shape): SynthExample[] {
-  const MAX_EXAMPLES = 3;
-  const examples: SynthExample[] = [];
-
-  if (template.paramNames.length === 0) {
-    for (let i = 0; i < MAX_EXAMPLES; i++) {
-      const request = `${template.method} ${template.pathTemplate}`;
-      const seed = hashSeed(`${request}#${i}`);
-      const ctx: SynthContext = { params: [], seed };
-      examples.push({ request, response: synthesizeValue(shape, ctx) });
-    }
-    return examples;
-  }
-
-  const valueLists = template.paramNames.map((name) => template.observedValues[name] ?? []);
-  const maxLen = Math.max(0, ...valueLists.map((v) => v.length));
-  const count = Math.min(MAX_EXAMPLES, maxLen || 1);
-
-  for (let i = 0; i < count; i++) {
-    const capturedValues = valueLists.map((vals) => (vals.length > 0 ? vals[i % vals.length] : '0'));
-    const resolvedPath = buildResolvedPath(template, capturedValues);
-    const params = resolveParams(template, capturedValues);
-    const request = `${template.method} ${resolvedPath}`;
-    const seed = hashSeed(request);
-    const ctx: SynthContext = { params, seed };
-    examples.push({ request, response: synthesizeValue(shape, ctx) });
-  }
-  return examples;
-}
-
 /** Infer templates + response shapes from captured traffic and write
- * `<captureDir>/synthetic/{index,examples}.json`. */
+ * `<captureDir>/synthetic/index.json`. */
 export function generateSynthetic(entries: CapturedTraffic[], captureDir: string): GenerateSummary {
   const groups = inferTemplateGroups(entries);
   const outDir = path.join(captureDir, 'synthetic');
   fs.mkdirSync(outDir, { recursive: true });
 
   const records: SyntheticTemplateRecord[] = [];
-  const examplesOut: Record<string, SynthExample[]> = {};
 
   for (const { template, entries: groupEntries } of groups) {
     // Prefer bodies from entries matching the template's modal status (the
@@ -124,7 +80,6 @@ export function generateSynthetic(entries: CapturedTraffic[], captureDir: string
 
     const shape = inferShape(bodies);
     records.push({ ...template, shape });
-    examplesOut[`${template.method} ${template.pathTemplate}`] = buildExamples(template, shape);
   }
 
   const index: SyntheticIndex = {
@@ -134,14 +89,11 @@ export function generateSynthetic(entries: CapturedTraffic[], captureDir: string
   };
 
   const indexPath = path.join(outDir, 'index.json');
-  const examplesPath = path.join(outDir, 'examples.json');
   fs.writeFileSync(indexPath, JSON.stringify(index, null, 2), 'utf-8');
-  fs.writeFileSync(examplesPath, JSON.stringify(examplesOut, null, 2), 'utf-8');
 
   return {
     outDir,
     indexPath,
-    examplesPath,
     templateCount: records.length,
     templates: records.map((r) => ({
       method: r.method,
