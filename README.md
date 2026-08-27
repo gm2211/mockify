@@ -38,10 +38,10 @@ captures/demo-grok/
 
 A capture is a folder of raw traffic from a real, often-authenticated session — treat it like you would any other file that might hold credentials, because it can. `--storage-state <path|keychain:name>` (see [Agent capture & MCP](#agent-capture--mcp)) starts the browser already logged in, and whatever that session sends — bearer tokens, session cookies, API keys — can end up in a request or response body that gets recorded.
 
-By default, mockify redacts credential-looking values before `traffic.json` (or, for `cdp-capture.ts`, its header dump) is ever written to disk:
+By default, mockify redacts credential-looking values before `traffic.json` is ever written to disk:
 
 - Request/response body fields whose key looks secret — `token`, `password`, `apiKey`/`api_key`, `secret`, `authorization`, `session`, `bearer` (case-insensitive, nested objects included) — have their value replaced with `"[REDACTED]"`. The key and the surrounding shape are preserved, so replay still works.
-- Wherever headers are captured (currently just the legacy `cdp-capture.ts` recorder — see the roadmap gap below), `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar credential-bearing header values get the same treatment.
+- Request and response headers — `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-CSRF-Token`, and similar credential-bearing header names — get the same treatment. A `Set-Cookie` that recorded several cookies at once still replays as that many (fake) cookies, not one.
 
 Every capture's `manifest.json` records whether redaction ran: `"redaction": true` (default) or `"redaction": false` (you passed `--no-redact`). Check that field — or just grep the capture — before pushing a `captures/` directory to a shared repo.
 
@@ -118,8 +118,18 @@ capture_start { "url": "..." } → read get_capture_guide → explore with brows
 A JSON array of request/response pairs, typed as `CapturedTraffic` in `src/format/types.ts`. Produced by mockify's own recorders and also by specify's capture command — mockify's recorders and mock server were extracted from specify and share this format with it.
 
 ```json
-{ "url": "https://example.com/api/widgets", "method": "GET", "status": 200, "contentType": "application/json; charset=utf-8", "responseBody": "{\"widgets\":[...]}" }
+{
+  "url": "https://example.com/api/widgets",
+  "method": "GET",
+  "status": 200,
+  "contentType": "application/json; charset=utf-8",
+  "responseBody": "{\"widgets\":[...]}",
+  "requestHeaders": { "accept": "application/json" },
+  "responseHeaders": { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" }
+}
 ```
+
+`requestHeaders`/`responseHeaders` are optional — every capture predating this field simply lacks it, and replay treats that the same as "no header data" rather than failing. `manifest.json`'s `formatVersion` records which shape a capture was written in (`CURRENT_CAPTURE_FORMAT_VERSION` in `src/format/types.ts`); absent means version 1, before headers existed. Replaying an entry replays every captured response header — `Set-Cookie` (including several at once), CORS's `Access-Control-Allow-*`, and so on — not just `Content-Type`; hop-by-hop headers (`Transfer-Encoding`, `Connection`, `Content-Length`, ...) are stripped and left to Node to manage. Matching an incoming request against multiple recorded entries on the same route additionally considers recorded request headers with SUBSET semantics — a recorded entry matches when its own significant headers (excluding volatile ones like `User-Agent`/`Date`/`Host`, and credential-bearing ones, which are already redacted to a placeholder) are all present in the incoming request with the same value — falling back permissively to the full candidate list when nothing matches, so old captures and partial header replication both keep working.
 
 ## Fault injection & diagnostics
 
@@ -137,7 +147,6 @@ MOCK_FAULT_RATE=0.1 npx mockify replay demo-grok
 
 `mockify.spec.yaml` is a starter behavioral spec in specify's v2 format, verifiable with `specify verify --spec mockify.spec.yaml`. Known gaps:
 
-- Header capture and replay (cookies/auth/CORS not currently replayable)
 - JSON request-body matching (currently form-encoded only)
 - Body matching for PUT/PATCH/DELETE (currently routed through GET matching)
 - Latency simulation from `tsStart`/`tsEnd` (captured but unused)

@@ -33,32 +33,22 @@ export interface CaptureSession {
   consoleLogCount: number;
 }
 
-/** A captured HTTP request. */
-export interface CapturedRequest {
-  /** Full request URL including query string. */
-  url: string;
-
-  /** HTTP method (GET, POST, PUT, DELETE, etc). */
-  method: string;
-
-  /** Request headers. */
-  headers?: Record<string, string>;
-
-  /** POST/PUT body data, if any. */
-  postData?: string | null;
-}
-
-/** A captured HTTP response. */
-export interface CapturedResponse {
-  /** HTTP status code. */
-  status: number;
-
-  /** Response content type header value. */
-  contentType: string;
-
-  /** Response body as a string, if captured (JSON/text only). */
-  body?: string | null;
-}
+/**
+ * Separator used to pack multiple values of the same response header (in
+ * practice this only ever happens for Set-Cookie — see
+ * CapturedTraffic.responseHeaders) into the single string this format's
+ * Record<string, string> shape allows. A raw newline can't appear inside a
+ * real header value, so it's a safe packing separator — see
+ * src/format/headers.ts's packMultiValueHeader/unpackMultiValueHeader for
+ * the pack/unpack functions themselves and the fuller rationale. Defined
+ * here (the pure-type/format module both depend on) rather than in
+ * headers.ts, so src/format/redact.ts — which needs it too, to redact a
+ * packed multi-value Set-Cookie per-value instead of collapsing the whole
+ * packed string to one placeholder — can reference it without creating an
+ * import cycle with headers.ts (which already depends on redact.ts for
+ * isSecretHeaderName).
+ */
+export const MULTI_VALUE_HEADER_SEPARATOR = '\n';
 
 /** A paired request + response captured during browsing. */
 export interface CapturedTraffic {
@@ -101,6 +91,28 @@ export interface CapturedTraffic {
   responseBody: string | null;
 
   /**
+   * Request headers, redacted (src/format/redact.ts) before this entry is
+   * ever written to disk — credential-bearing values (Authorization,
+   * Cookie, X-Api-Key, ...) become "[REDACTED]", everything else passes
+   * through unchanged. Header names are lower-cased (mirrors Playwright's
+   * own Request#allHeaders()). Optional because it's new in format version
+   * 2 (see CURRENT_CAPTURE_FORMAT_VERSION below) — every capture written
+   * before SP-lsc.8 simply lacks this field, and loaders/matching must
+   * treat that the same as "no header constraints", not an error.
+   */
+  requestHeaders?: Record<string, string>;
+
+  /**
+   * Response headers, redacted the same way. A header that appeared
+   * multiple times on the real response — in practice this only happens
+   * for Set-Cookie — is packed into one string with
+   * packMultiValueHeader/unpackMultiValueHeader (src/format/headers.ts);
+   * unpack before treating a value as a single header line. Optional for
+   * the same reason as requestHeaders.
+   */
+  responseHeaders?: Record<string, string>;
+
+  /**
    * Set when this entry was synthetically produced by the seeded fault
    * injector (src/agent/fault-injector.ts) rather than observed from the
    * live target — e.g. "500", "timeout", "abort", "empty". Absent for real
@@ -139,6 +151,16 @@ export interface CaptureManifest {
    */
   redaction: boolean;
 
+  /**
+   * traffic.json entry format version — see CURRENT_CAPTURE_FORMAT_VERSION
+   * below. Absent on a manifest written before this field existed; treat a
+   * missing value the same as version 1 (resolveCaptureFormatVersion does
+   * exactly this). Every consumer of traffic.json must keep loading older
+   * versions rather than rejecting them — CapturedTraffic's new fields are
+   * all optional for exactly that reason.
+   */
+  formatVersion?: number;
+
   /** Path to traffic.json relative to the capture directory. */
   trafficFile: string;
 
@@ -160,4 +182,29 @@ export interface CaptureManifest {
    * this session. See src/agent/observation.ts.
    */
   observationsFile?: string;
+}
+
+/**
+ * Current traffic.json entry format version, written to manifest.json's
+ * `formatVersion` field by CaptureCollector.save() (src/agent/capture.ts).
+ *
+ *   1 (implicit — no `formatVersion` field was ever written for this
+ *     version) — the original flat request/response pair shape: url,
+ *     method, postData, status, contentType, ts[Start/End], responseBody.
+ *   2 — adds optional requestHeaders/responseHeaders (SP-lsc.8).
+ *
+ * Bump this whenever CapturedTraffic's shape changes in a way a strict
+ * consumer might care about, and add a line above describing what changed.
+ * Every field added at version 2+ must stay optional so a loader written
+ * for a later version still accepts an earlier one without special-casing —
+ * see resolveCaptureFormatVersion.
+ */
+export const CURRENT_CAPTURE_FORMAT_VERSION = 2;
+
+/** manifest.formatVersion, defaulting to 1 for a manifest written before
+ * that field existed (or a manifest that's missing/unreadable entirely). */
+export function resolveCaptureFormatVersion(
+  manifest: Pick<CaptureManifest, 'formatVersion'> | null | undefined,
+): number {
+  return manifest?.formatVersion ?? 1;
 }

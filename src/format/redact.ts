@@ -27,13 +27,18 @@
  * still returns a same-shaped JSON object with the same keys, just without
  * the real secret value.
  *
- * Out of scope: request/response headers are only actually captured today by
- * the legacy cdp-capture.ts recorder (see README's "Header capture and
- * replay" roadmap gap) — the agent/MCP/manual capture paths don't record
- * headers at all yet, so there's nothing for redactHeaders() to act on there
- * until that lands. redactHeaders() exists so whichever recorder does carry
- * headers redacts them the same way.
+ * Headers are captured by both the agent/MCP/manual capture path
+ * (CaptureCollector, src/agent/capture.ts — SP-lsc.8) and the legacy
+ * cdp-capture.ts recorder; both redact them through redactHeaders() before
+ * anything reaches disk, via redactTrafficEntry() below in the former case.
+ * What makes a captured header significant for *matching* an incoming
+ * replay request, and which captured response headers actually get
+ * replayed, live in src/format/headers.ts, not here — this module only
+ * ever decides what a header's VALUE should look like once it's known to
+ * be secret.
  */
+
+import { MULTI_VALUE_HEADER_SEPARATOR } from './types.js';
 
 export const REDACTED = '[REDACTED]';
 
@@ -47,6 +52,8 @@ const SECRET_HEADER_NAMES = new Set([
   'x-auth-token',
   'x-access-token',
   'x-session-token',
+  'x-csrf-token',
+  'x-xsrf-token',
 ]);
 
 /** Substrings (matched against a normalized key) that mark a body field as
@@ -80,12 +87,30 @@ export function isSecretHeaderName(name: string): boolean {
 
 /** Redact credential-bearing header values in place (returns a new object;
  * `headers` itself is left untouched). Non-secret headers pass through
- * unchanged. Accepts undefined/null so callers don't need to guard. */
+ * unchanged. Accepts undefined/null so callers don't need to guard.
+ *
+ * Set-Cookie gets one deliberate exception to the flat "whole value becomes
+ * REDACTED" rule: a captured response can carry *multiple* Set-Cookie
+ * lines, packed at capture time (src/format/headers.ts's
+ * packMultiValueHeader) into one MULTI_VALUE_HEADER_SEPARATOR-joined
+ * string. Replacing that entire packed string with a single REDACTED would
+ * silently collapse N cookies down to one on replay — still safe (no real
+ * value leaks), but a real loss of shape for no security benefit. Each
+ * packed value is redacted independently instead, so the *count* of
+ * Set-Cookie lines a redacted capture replays still matches what was
+ * actually observed. A single (unpacked) Set-Cookie value has nothing to
+ * split on and redacts to plain REDACTED, same as before. */
 export function redactHeaders<T extends Record<string, string> | undefined | null>(headers: T): T {
   if (!headers) return headers;
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
-    out[key] = isSecretHeaderName(key) ? REDACTED : value;
+    if (!isSecretHeaderName(key)) {
+      out[key] = value;
+      continue;
+    }
+    out[key] = key.toLowerCase() === 'set-cookie'
+      ? value.split(MULTI_VALUE_HEADER_SEPARATOR).map(() => REDACTED).join(MULTI_VALUE_HEADER_SEPARATOR)
+      : REDACTED;
   }
   return out as T;
 }
@@ -162,17 +187,20 @@ export function redactBodyString<T extends string | null | undefined>(body: T): 
   return body;
 }
 
-/** Shape shared by CapturedTraffic (src/format/types.ts) and the legacy
- * cdp-capture.ts CapturedRequest — anything with a request/response body
- * pair that redaction can walk. */
+/** Shape shared by CapturedTraffic (src/format/types.ts) — anything with a
+ * request/response body pair and/or header maps that redaction can walk. */
 export interface RedactableBody {
   postData?: string | null;
   responseBody?: string | null;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
 }
 
-/** Redact the request/response body of a single captured traffic entry,
- * preserving every other field. Safe to call on entries that lack one of
- * the body fields (postData/responseBody stay undefined). */
+/** Redact the request/response body AND headers of a single captured
+ * traffic entry, preserving every other field. Safe to call on entries
+ * that lack any of these fields (they stay undefined) — in particular,
+ * every entry predating SP-lsc.8 has no header fields at all, and this is a
+ * no-op for them beyond the body redaction it already did. */
 export function redactTrafficEntry<T extends RedactableBody>(entry: T): T {
   const next: T = { ...entry };
   if ('postData' in entry) {
@@ -180,6 +208,12 @@ export function redactTrafficEntry<T extends RedactableBody>(entry: T): T {
   }
   if ('responseBody' in entry) {
     next.responseBody = redactBodyString(entry.responseBody);
+  }
+  if ('requestHeaders' in entry) {
+    next.requestHeaders = redactHeaders(entry.requestHeaders);
+  }
+  if ('responseHeaders' in entry) {
+    next.responseHeaders = redactHeaders(entry.responseHeaders);
   }
   return next;
 }

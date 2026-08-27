@@ -40,6 +40,12 @@ test('isSecretHeaderName: matches Authorization/Cookie/Set-Cookie/x-api-key case
   }
 });
 
+test('isSecretHeaderName: matches X-CSRF-Token/X-XSRF-Token case-insensitively (SP-lsc.8)', () => {
+  for (const name of ['X-CSRF-Token', 'x-csrf-token', 'X-XSRF-TOKEN', 'x-xsrf-token']) {
+    assert.equal(isSecretHeaderName(name), true, `expected "${name}" to be treated as secret`);
+  }
+});
+
 test('isSecretHeaderName: leaves ordinary headers alone', () => {
   for (const name of ['content-type', 'accept', 'x-request-id', 'user-agent']) {
     assert.equal(isSecretHeaderName(name), false, `expected "${name}" to NOT be treated as secret`);
@@ -70,6 +76,11 @@ test('redactHeaders: replaces Authorization/Cookie/Set-Cookie/x-api-key values, 
 test('redactHeaders: passes through undefined/null without throwing', () => {
   assert.equal(redactHeaders(undefined), undefined);
   assert.equal(redactHeaders(null), null);
+});
+
+test('redactHeaders: a packed multi-value Set-Cookie (SP-lsc.8) redacts each packed value independently, preserving the count', () => {
+  const out = redactHeaders({ 'set-cookie': 'session=s1; Path=/\ntheme=dark; Path=/' });
+  assert.equal(out['set-cookie'], `${REDACTED}\n${REDACTED}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -186,6 +197,38 @@ test('redactTrafficEntry: redacts postData and responseBody, preserves every oth
   assert.equal(JSON.parse(out.responseBody!).expiresIn, 3600);
   // Original entry is untouched — redaction returns a new object.
   assert.ok(entry.postData.includes('hunter2'));
+});
+
+test('redactTrafficEntry: redacts requestHeaders/responseHeaders when present (SP-lsc.8), leaves them absent when the entry has none', () => {
+  const withHeaders = {
+    url: 'https://x.test/api/me',
+    method: 'GET',
+    postData: null,
+    status: 200,
+    contentType: 'application/json',
+    ts: 1,
+    responseBody: null,
+    requestHeaders: { authorization: 'Bearer abc', accept: 'application/json' },
+    responseHeaders: { 'set-cookie': 'session=s1; Path=/', 'content-type': 'application/json' },
+  };
+  const out = redactTrafficEntry(withHeaders);
+  assert.equal(out.requestHeaders!.authorization, REDACTED);
+  assert.equal(out.requestHeaders!.accept, 'application/json');
+  assert.equal(out.responseHeaders!['set-cookie'], REDACTED);
+  assert.equal(out.responseHeaders!['content-type'], 'application/json');
+
+  const withoutHeaders = {
+    url: 'https://x.test/api/widgets',
+    method: 'GET',
+    postData: null,
+    status: 200,
+    contentType: 'application/json',
+    ts: 1,
+    responseBody: null,
+  };
+  const out2 = redactTrafficEntry(withoutHeaders);
+  assert.equal('requestHeaders' in out2, false);
+  assert.equal('responseHeaders' in out2, false);
 });
 
 // ---------------------------------------------------------------------------

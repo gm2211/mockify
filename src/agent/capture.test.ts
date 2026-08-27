@@ -82,8 +82,21 @@ function tmpOutputDir(): string {
 
 /** Minimal fake Playwright Route capturing which methods were invoked.
  * `body.postData`/`body.responseBody` let tests exercise the redaction
- * choke point without a real browser. */
-function fakeRoute(url: string, method: string, body?: { postData?: string | null; responseBody?: string }) {
+ * choke point without a real browser. `body.requestHeaders` fakes
+ * Request#allHeaders(); `body.responseHeaders` (a name/value array, like
+ * the real APIResponse#headersArray()) fakes the response side — both
+ * default to empty so existing callers that don't care about headers don't
+ * need to change. */
+function fakeRoute(
+  url: string,
+  method: string,
+  body?: {
+    postData?: string | null;
+    responseBody?: string;
+    requestHeaders?: Record<string, string>;
+    responseHeaders?: Array<{ name: string; value: string }>;
+  },
+) {
   const calls: { fetch: number; fulfill: unknown[]; abort: unknown[]; continue: number } = {
     fetch: 0,
     fulfill: [],
@@ -95,12 +108,15 @@ function fakeRoute(url: string, method: string, body?: { postData?: string | nul
       url: () => url,
       method: () => method,
       postData: () => body?.postData ?? null,
+      allHeaders: async () => body?.requestHeaders ?? {},
     }),
     fetch: async () => {
       calls.fetch++;
+      const responseHeadersArray = body?.responseHeaders ?? [{ name: 'content-type', value: 'application/json' }];
       return {
         status: () => 200,
-        headers: () => ({ 'content-type': 'application/json' }),
+        headers: () => Object.fromEntries(responseHeadersArray.map((h) => [h.name.toLowerCase(), h.value])),
+        headersArray: () => responseHeadersArray,
         text: async () => body?.responseBody ?? '{}',
       };
     },
@@ -318,4 +334,110 @@ test('redaction also applies to entries recorded via attachToContext()\'s route 
   assert.equal(traffic.length, 1);
   assert.equal(JSON.parse(traffic[0].postData!).password, '[REDACTED]');
   assert.equal(JSON.parse(traffic[0].responseBody!).token, '[REDACTED]');
+});
+
+// ---------------------------------------------------------------------------
+// Header capture and redaction (SP-lsc.8)
+// ---------------------------------------------------------------------------
+
+test('attachToContext() captures request and response headers, not just the body', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test', hostFilter: 'x.test' });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://x.test/api/widgets', 'GET', {
+    requestHeaders: { accept: 'application/json', 'x-tenant': 'acme' },
+    responseHeaders: [
+      { name: 'Content-Type', value: 'application/json' },
+      { name: 'X-Request-Id', value: 'r-1' },
+    ],
+  });
+  await getHandler()(route);
+
+  const traffic = collector.getTraffic();
+  assert.equal(traffic.length, 1);
+  assert.equal(traffic[0].requestHeaders?.accept, 'application/json');
+  assert.equal(traffic[0].requestHeaders?.['x-tenant'], 'acme');
+  assert.equal(traffic[0].responseHeaders?.['content-type'], 'application/json');
+  assert.equal(traffic[0].responseHeaders?.['x-request-id'], 'r-1');
+  // contentType is still derived from the captured headers, same as before.
+  assert.equal(traffic[0].contentType, 'application/json');
+});
+
+test('attachToContext() packs repeated response headers (Set-Cookie) instead of dropping/folding them', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test', hostFilter: 'x.test' });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://x.test/api/login', 'POST', {
+    responseHeaders: [
+      { name: 'Content-Type', value: 'application/json' },
+      { name: 'Set-Cookie', value: 'session=s1; Path=/' },
+      { name: 'Set-Cookie', value: 'theme=dark; Path=/' },
+    ],
+  });
+  await getHandler()(route);
+
+  const traffic = collector.getTraffic();
+  // Set-Cookie is packed with "\n" (src/format/headers.ts's
+  // MULTI_VALUE_HEADER_SEPARATOR) *before* redaction, and redaction
+  // redacts each packed value independently rather than collapsing the
+  // whole packed string to one placeholder — so two captured Set-Cookie
+  // lines still replay as two (fake) Set-Cookie lines, not one.
+  assert.equal(traffic[0].responseHeaders?.['set-cookie'], '[REDACTED]\n[REDACTED]');
+});
+
+test('header capture is redacted the same way as bodies: Authorization/Cookie/Set-Cookie values never reach traffic.json in plain text', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test', hostFilter: 'x.test' });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://x.test/api/me', 'GET', {
+    requestHeaders: { authorization: 'Bearer super-secret-token', cookie: 'session=real-value' },
+    responseHeaders: [{ name: 'Content-Type', value: 'application/json' }],
+  });
+  await getHandler()(route);
+
+  const traffic = collector.getTraffic();
+  assert.equal(traffic[0].requestHeaders?.authorization, '[REDACTED]');
+  assert.equal(traffic[0].requestHeaders?.cookie, '[REDACTED]');
+});
+
+test('redact: false (the --no-redact escape hatch) leaves captured headers, including Authorization/Cookie, unredacted', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({
+    outputDir: dir,
+    targetUrl: 'https://x.test',
+    hostFilter: 'x.test',
+    redact: false,
+  });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://x.test/api/me', 'GET', {
+    requestHeaders: { authorization: 'Bearer super-secret-token' },
+    responseHeaders: [
+      { name: 'Content-Type', value: 'application/json' },
+      { name: 'Set-Cookie', value: 'session=real-value; Path=/' },
+    ],
+  });
+  await getHandler()(route);
+
+  const traffic = collector.getTraffic();
+  assert.equal(traffic[0].requestHeaders?.authorization, 'Bearer super-secret-token');
+  assert.equal(traffic[0].responseHeaders?.['set-cookie'], 'session=real-value; Path=/');
+});
+
+test('save() writes CURRENT_CAPTURE_FORMAT_VERSION into manifest.json, and it round-trips through JSON', () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+
+  const manifest = collector.save();
+  assert.equal(manifest.formatVersion, 2);
+
+  const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
+  assert.equal(onDisk.formatVersion, 2);
 });

@@ -10,7 +10,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { BrowserContext, Page } from 'playwright';
 import type { CapturedTraffic, CapturedConsoleEntry, CaptureManifest } from '../format/types.js';
+import { CURRENT_CAPTURE_FORMAT_VERSION } from '../format/types.js';
 import { redactTrafficEntry, envDisablesRedaction } from '../format/redact.js';
+import { packHeadersArray } from '../format/headers.js';
 
 const STATIC_EXT = new Set([
   '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg',
@@ -171,16 +173,30 @@ export class CaptureCollector {
 
       if (shouldCapture(url, this.hostFilter)) {
         const tsEnd = Date.now();
+
+        // request.allHeaders() (unlike the sync request.headers()) is the
+        // one that includes Cookie and other security-related headers —
+        // see the Playwright doc comment on Request#headers(). It's async,
+        // but we're already in an async route handler. response.headersArray()
+        // (sync — this `response` is the APIResponse route.fetch() returned)
+        // is used instead of response.headers() specifically so a repeated
+        // header (Set-Cookie) doesn't get silently folded/dropped before
+        // packHeadersArray gets a chance to pack it properly.
+        const requestHeaders = await request.allHeaders().catch(() => ({}));
+        const responseHeaders = packHeadersArray(response.headersArray());
+
         const entry: CapturedTraffic = {
           url,
           method,
           postData: request.postData() ?? null,
           status: response.status(),
-          contentType: response.headers()['content-type'] ?? '',
+          contentType: responseHeaders['content-type'] ?? '',
           ts: tsEnd,
           tsStart,
           tsEnd,
           responseBody: null,
+          requestHeaders,
+          responseHeaders,
         };
 
         const ct = (entry.contentType ?? '').toLowerCase();
@@ -314,6 +330,7 @@ export class CaptureCollector {
         consoleLogCount: this.consoleLogs.length,
       },
       redaction: this.redact,
+      formatVersion: CURRENT_CAPTURE_FORMAT_VERSION,
       trafficFile: 'traffic.json',
       consoleFile: 'console.json',
       screenshotFiles,
