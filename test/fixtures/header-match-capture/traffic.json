@@ -1,0 +1,81 @@
+[
+  {
+    "url": "https://fixture.test/api/dashboard",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 1000,
+    "responseBody": "{\"tenant\":\"acme\",\"widgets\":3}",
+    "requestHeaders": { "x-tenant": "acme", "accept": "application/json" },
+    "responseHeaders": { "content-type": "application/json" }
+  },
+  {
+    "url": "https://fixture.test/api/dashboard",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 2000,
+    "responseBody": "{\"tenant\":\"globex\",\"widgets\":9}",
+    "requestHeaders": { "x-tenant": "globex", "accept": "application/json" },
+    "responseHeaders": { "content-type": "application/json" }
+  },
+  {
+    "url": "https://fixture.test/api/profile",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 3000,
+    "responseBody": "{\"id\":1,\"name\":\"alice\"}",
+    "requestHeaders": { "accept": "application/json" },
+    "responseHeaders": {
+      "content-type": "application/json",
+      "set-cookie": "session=[REDACTED]; Path=/; HttpOnly",
+      "access-control-allow-origin": "https://app.fixture.test",
+      "access-control-allow-credentials": "true",
+      "transfer-encoding": "bogus-captured-encoding",
+      "connection": "bogus-captured-connection",
+      "content-length": "999999"
+    }
+  },
+  {
+    "url": "https://fixture.test/api/profile",
+    "method": "OPTIONS",
+    "postData": null,
+    "status": 204,
+    "contentType": "",
+    "ts": 3500,
+    "responseBody": null,
+    "requestHeaders": { "origin": "https://app.fixture.test", "access-control-request-method": "GET" },
+    "responseHeaders": {
+      "access-control-allow-origin": "https://app.fixture.test",
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "Content-Type, X-Tenant",
+      "access-control-max-age": "600"
+    }
+  },
+  {
+    "url": "https://fixture.test/api/multi-cookie",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 4000,
+    "responseBody": "{\"ok\":true}",
+    "responseHeaders": {
+      "content-type": "application/json",
+      "set-cookie": "session=[REDACTED]; Path=/\ntheme=dark; Path=/"
+    }
+  },
+  {
+    "url": "https://fixture.test/api/legacy-no-headers",
+    "method": "GET",
+    "postData": null,
+    "status": 200,
+    "contentType": "application/json",
+    "ts": 5000,
+    "responseBody": "{\"legacy\":true}"
+  }
+]

@@ -16,6 +16,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { CaptureManifest } from '../format/types.js';
+import { resolveCaptureFormatVersion } from '../format/types.js';
 
 // ---------------------------------------------------------------------------
 // Root directory
@@ -89,6 +90,12 @@ export interface CaptureSummary {
   syntheticTemplates: number;
   /** ISO timestamp from manifest.json, or '' if unavailable. */
   capturedAt: string;
+  /**
+   * traffic.json entry format version (see CURRENT_CAPTURE_FORMAT_VERSION,
+   * src/format/types.ts) — 1 for a capture predating requestHeaders/
+   * responseHeaders (SP-lsc.8), including one with no manifest.json at all.
+   */
+  formatVersion: number;
 }
 
 /** Best-effort summary of a single capture directory. Returns null when the
@@ -112,14 +119,19 @@ export function summarizeCapture(name: string, dir: string): CaptureSummary | nu
 
   let target = '';
   let capturedAt = '';
+  // resolveCaptureFormatVersion(undefined) already falls back to 1 — this is
+  // what makes "no manifest.json at all" (an even older capture than "has a
+  // manifest but it predates the formatVersion field") resolve the same way.
+  let formatVersion = resolveCaptureFormatVersion(undefined);
   const manifestPath = path.join(dir, 'manifest.json');
   if (fs.existsSync(manifestPath)) {
     try {
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as CaptureManifest;
       target = manifest.session?.targetUrl ?? '';
       capturedAt = manifest.session?.timestamp ?? '';
+      formatVersion = resolveCaptureFormatVersion(manifest);
     } catch {
-      // Malformed manifest — fall back to '' for target/capturedAt below.
+      // Malformed manifest — fall back to '' / version 1 below.
     }
   }
 
@@ -147,7 +159,7 @@ export function summarizeCapture(name: string, dir: string): CaptureSummary | nu
     }
   }
 
-  return { name, dir, target, requests, screenshots, syntheticTemplates, capturedAt };
+  return { name, dir, target, requests, screenshots, syntheticTemplates, capturedAt, formatVersion };
 }
 
 /** List every saved capture under capturesRoot(), newest first. Directories

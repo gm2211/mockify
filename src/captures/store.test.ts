@@ -261,6 +261,47 @@ test('listCaptures: tolerates a malformed traffic.json by skipping that dir, wit
 });
 
 // ---------------------------------------------------------------------------
+// formatVersion (SP-lsc.8) — resolveCaptureFormatVersion via summarizeCapture
+// ---------------------------------------------------------------------------
+
+test('summarizeCapture: formatVersion defaults to 1 when manifest.json is absent entirely', async () => {
+  await withTempCapturesRoot((root) => {
+    writeCapture(path.join(root, 'no-manifest'), { traffic: [] });
+
+    const [capture] = listCaptures();
+    assert.equal(capture.formatVersion, 1);
+  });
+});
+
+test('summarizeCapture: formatVersion defaults to 1 when manifest.json exists but predates the field', async () => {
+  await withTempCapturesRoot((root) => {
+    writeCapture(path.join(root, 'old-manifest'), {
+      traffic: [],
+      manifest: { session: { timestamp: '2024-01-01T00:00:00Z', targetUrl: 'https://x.test' }, redaction: true },
+    });
+
+    const [capture] = listCaptures();
+    assert.equal(capture.formatVersion, 1);
+  });
+});
+
+test('summarizeCapture: formatVersion reflects manifest.formatVersion when present (SP-lsc.8 captures)', async () => {
+  await withTempCapturesRoot((root) => {
+    writeCapture(path.join(root, 'new-manifest'), {
+      traffic: [],
+      manifest: {
+        session: { timestamp: '2024-01-01T00:00:00Z', targetUrl: 'https://x.test' },
+        redaction: true,
+        formatVersion: 2,
+      },
+    });
+
+    const [capture] = listCaptures();
+    assert.equal(capture.formatVersion, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // resolveCapture
 // ---------------------------------------------------------------------------
 

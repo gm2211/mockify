@@ -54,10 +54,18 @@
  *                        falls through to the next tier rather than ever
  *                        500ing.
  *   2. recorded       — an exact recorded request/response match, scored
- *                        against query params / POST body. Backs up
- *                        whatever the implementation tier declined (or
- *                        answers everything when no implementation is
- *                        loaded).
+ *                        against query params / POST body, and narrowed by
+ *                        recorded request headers where present (SUBSET
+ *                        match — see src/format/headers.ts's
+ *                        headersSubsetMatch; permissive when a candidate
+ *                        has no header data, which is every capture from
+ *                        before SP-lsc.8). Backs up whatever the
+ *                        implementation tier declined (or answers
+ *                        everything when no implementation is loaded).
+ *                        Replays every captured response header — Set-
+ *                        Cookie, CORS's Access-Control-Allow-*, and so on —
+ *                        not just Content-Type (buildReplayResponseHeaders,
+ *                        same module); hop-by-hop headers are stripped.
  *   3. synthetic       — shape-based synthesis from OTHER recorded requests
  *                        that match the same endpoint template (see
  *                        src/synthesize/), e.g. `/api/room/7` succeeding
@@ -78,6 +86,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { pathToFileURL } from 'url';
 import type { CapturedTraffic } from './format/types.js';
+import { headersSubsetMatch, buildReplayResponseHeaders } from './format/headers.js';
 import {
   loadSyntheticIndex,
   matchSyntheticTemplate,
@@ -416,6 +425,26 @@ function bestPostMatch(entries: TrafficEntry[], incomingBody: string): TrafficEn
     }
   }
   return best;
+}
+
+// ---------------------------------------------------------------------------
+// Request header matching (SP-lsc.8) — see src/format/headers.ts for the
+// subset-match semantics themselves.
+// ---------------------------------------------------------------------------
+
+/** Narrow `entries` to the ones whose recorded significant request headers
+ * are a subset of `incomingHeaders` (headersSubsetMatch). Deliberately
+ * falls back to the full, unfiltered list when nothing matches instead of
+ * returning an empty result — this is what keeps header-based matching
+ * *permissive by default*: an entry recorded before SP-lsc.8 (no header
+ * data at all) always passes trivially, and even when headers were
+ * recorded, a replay client that doesn't reproduce every recorded header
+ * still gets *a* response instead of being shut out entirely. Query-param /
+ * POST-body scoring (bestGetMatch/bestPostMatch) then decides among
+ * whichever list this returns. */
+function filterByHeaderMatch(entries: TrafficEntry[], incomingHeaders: Record<string, string>): TrafficEntry[] {
+  const filtered = entries.filter((e) => headersSubsetMatch(e.requestHeaders, incomingHeaders));
+  return filtered.length > 0 ? filtered : entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +1021,11 @@ function createServer(
       bodyText = await readBody(req);
     }
 
+    // Flattened once and reused by both the implementation tier and the
+    // recorded tier's header-based matching (filterByHeaderMatch, SP-lsc.8)
+    // below.
+    const incomingHeaders = flattenHeaders(req.headers);
+
     // ── Tier 1: implementation ──────────────────────────────────────────────
     // Tried first when loaded (auto/impl modes): it's the one tier that can
     // stay self-consistent across a POST-then-GET sequence (real routing +
@@ -1004,7 +1038,7 @@ function createServer(
 
       const outcome = await callImplementation(
         loadedImpl.impl,
-        { method, path: pathname, query, headers: flattenHeaders(req.headers), body: bodyText },
+        { method, path: pathname, query, headers: incomingHeaders, body: bodyText },
         IMPL_TIMEOUT_MS
       );
 
@@ -1049,7 +1083,15 @@ function createServer(
     // The implementation tier either wasn't consulted, declined, or isn't
     // loaded — fall back to an exact recorded request/response match,
     // scored against query params / POST body.
-    const matchedEntries = index.get(routeKey);
+    const routeEntries = index.get(routeKey);
+    // Narrow to entries whose recorded significant request headers are a
+    // subset of what this request actually sent (SP-lsc.8) before scoring
+    // by query params / POST body — permissive by default (see
+    // filterByHeaderMatch's doc comment): an old capture with no header
+    // data, or a request that matches no recorded header combination at
+    // all, still gets scored against the full candidate list rather than
+    // being excluded outright.
+    const matchedEntries = routeEntries ? filterByHeaderMatch(routeEntries, incomingHeaders) : routeEntries;
 
     if (matchedEntries && matchedEntries.length > 0) {
       let entry: TrafficEntry | null;
@@ -1074,10 +1116,11 @@ function createServer(
         }
 
         // ── Send recorded response ──────────────────────────────────────
-        res.writeHead(entry.status, {
-          'Content-Type': entry.contentType || 'application/octet-stream',
-          'X-Mockify-Tier': 'recorded',
-        });
+        // Replays every captured response header (Set-Cookie, CORS's
+        // Access-Control-Allow-*, ...), not just Content-Type — hop-by-hop
+        // headers are stripped and Content-Type is always set explicitly.
+        // See src/format/headers.ts's buildReplayResponseHeaders.
+        res.writeHead(entry.status, buildReplayResponseHeaders(entry, { 'X-Mockify-Tier': 'recorded' }));
         res.end(entry.responseBody ?? '');
         return;
       }
