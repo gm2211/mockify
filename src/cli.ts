@@ -657,6 +657,13 @@ function onInferProgress(event: InferProgressEvent): void {
           `(${event.examplesPerTemplate} example(s)/template, bodies capped at ${event.bodyCharCap} chars)`
       );
       break;
+    case 'budget_warning':
+      console.error(
+        `warning: budget is $${event.budgetUsd}, but a ${event.promptChars.toLocaleString()}-char prompt has ` +
+          `historically needed roughly $${event.suggestedMinUsd.toFixed(0)} per round on the default model — ` +
+          `raise ${event.envVar} if generation stops with a budget error`
+      );
+      break;
     case 'round_start':
       console.error(`round ${event.round}/${event.rounds}: generating...`);
       break;
