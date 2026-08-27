@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No engines field or .nvmrc in package.json at the time this workflow
+      # was added, so we pin to the current Node.js LTS line explicitly.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (tsc)
+        run: npx tsc
+
+      # The test suite (src/**/*.test.ts, run via `npm test`) does not
+      # exercise Playwright/Chromium directly: no *.test.ts imports
+      # playwright/chromium, so no browser install is needed here. Modules
+      # that do launch a real browser (src/agent/runner.ts,
+      # src/mcp/server.ts, src/recorders/browse-and-capture.mjs) are not
+      # covered by any current test file.
+      #
+      # src/mock-server-synthetic.test.ts is a known intermittent flake:
+      # it spawns the CLI's `serve` subcommand as a child process and hits
+      # it over HTTP immediately after, and occasionally loses the port
+      # race (ECONNREFUSED) before the server is listening. That is
+      # tracked separately and is NOT fixed by this workflow. To keep CI
+      # signal useful without masking real failures or retrying the whole
+      # suite, that one file gets a single retry; everything else runs
+      # once with no retry.
+      - name: Test (excluding known-flaky synthetic suite)
+        run: find src -name '*.test.ts' ! -name 'mock-server-synthetic.test.ts' -print0 | xargs -0 node --import tsx --test
+
+      - name: Test mock-server-synthetic (known port-race flake, single retry)
+        run: |
+          node --import tsx --test src/mock-server-synthetic.test.ts || {
+            echo "::warning::mock-server-synthetic.test.ts failed, retrying once (known ECONNREFUSED port race, tracked separately)";
+            node --import tsx --test src/mock-server-synthetic.test.ts;
+          }
