@@ -6,62 +6,29 @@
  * the module directly without also starting a live server. This spawns the
  * CLI's `serve` subcommand as a child process instead and exercises it over
  * HTTP — the same path a real `mockify serve --data <dir>` invocation takes.
+ *
+ * Server readiness (SP-ish): spawnMockServer() (src/test-helpers/
+ * spawn-mock-server.ts) waits for the server's own "listening" line rather
+ * than an earlier startup log line — see that module's doc comment for why
+ * the earlier approach was an outright race, not just a slow-CI flake.
  */
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { spawn } from 'node:child_process';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { spawnMockServer, REPO_ROOT } from './test-helpers/spawn-mock-server.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dirname, '..');
-const CLI_PATH = path.join(REPO_ROOT, 'src', 'cli.ts');
 // test/fixtures/captures/traffic.json — pointing MOCK_DATA_PATH at this
 // *directory* (not the file inside it) is exactly the directory form
 // loadTraffic() must accept.
 const FIXTURE_CAPTURE_DIR = path.join(REPO_ROOT, 'test', 'fixtures', 'captures');
 
-function waitForOutput(child: ReturnType<typeof spawn>, pattern: RegExp, timeoutMs = 10_000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let buf = '';
-    const timer = setTimeout(() => {
-      reject(new Error(`Timed out waiting for /${pattern.source}/ in server output. Got:\n${buf}`));
-    }, timeoutMs);
-    const onData = (data: Buffer) => {
-      buf += data.toString();
-      if (pattern.test(buf)) {
-        clearTimeout(timer);
-        child.stderr?.off('data', onData);
-        resolve(buf);
-      }
-    };
-    child.stderr?.on('data', onData);
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
-
 test('mockify serve accepts a capture directory (not just traffic.json) via MOCK_DATA_PATH', async () => {
-  const port = 34567 + Math.floor(Math.random() * 1000);
-
-  const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, 'serve'], {
-    cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      PORT: String(port),
-      MOCK_DATA_PATH: FIXTURE_CAPTURE_DIR,
-    },
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-
+  const { child, port, stderr } = await spawnMockServer({ MOCK_DATA_PATH: FIXTURE_CAPTURE_DIR });
   try {
-    const output = await waitForOutput(child, /Loaded \d+ traffic entries/);
-    assert.match(output, /Loaded \d+ traffic entries from traffic\.json/);
+    assert.match(stderr, /Loaded \d+ traffic entries from traffic\.json/);
 
-    const res = await fetch(`http://localhost:${port}/_traffic`);
+    const res = await fetch(`http://127.0.0.1:${port}/_traffic`);
     assert.equal(res.status, 200);
     const body = (await res.json()) as Array<{ url: string; method: string }>;
     assert.ok(Array.isArray(body));
