@@ -30,19 +30,27 @@
  *                            disable host filtering entirely
  *   CAPTURE_OUTPUT_DIR     — base directory for captures (default: captures)
  *   CAPTURE_SCREENSHOT_DELAY_MS — debounce ms for API screenshots (default: 800)
+ *   MOCKIFY_NO_REDACT      — set to "1" (or pass --no-redact) to skip
+ *                            credential redaction and write raw request/
+ *                            response body values (default: redacted)
  *
  * Output (in <CAPTURE_OUTPUT_DIR>/<timestamp>/):
  *   traffic.json        — all captured API requests with response bodies
+ *                          (credential-bearing body fields redacted by
+ *                          default — see redactBody() below, ported from
+ *                          src/format/redact.ts since this script has no
+ *                          build step)
  *   console.json        — browser console log entries
  *   screenshots/        — auto-captured PNGs on each page navigation
  *   summary.txt         — endpoint summary table
  *   js-sources.json     — script URLs found on pages visited
+ *   manifest.json        — session metadata, incl. whether redaction ran
  *
  * Give the output folder to an LLM for analysis.
  */
 
 import { chromium } from "playwright";
-import { writeFileSync, mkdirSync } from "fs";
+import { writeFileSync, mkdirSync, readdirSync } from "fs";
 import { join, extname } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { dirname } from "path";
@@ -71,6 +79,13 @@ if (!hostFilter) {
 }
 
 const SCREENSHOT_DELAY_MS = parseInt(process.env.CAPTURE_SCREENSHOT_DELAY_MS ?? "800", 10);
+
+// --no-redact escape hatch (SP-lsc.7). `mockify capture --manual --no-redact`
+// forwards this as an env var (this script is spawned as a child process —
+// see runManualCapture() in src/cli.ts); running the script directly also
+// accepts the flag on argv.
+const NO_REDACT_ENV = (process.env.MOCKIFY_NO_REDACT ?? "").trim().toLowerCase();
+const REDACT = !(process.argv.includes("--no-redact") || NO_REDACT_ENV === "1" || NO_REDACT_ENV === "true");
 
 const STATIC_EXT = new Set([
   ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg",
@@ -186,6 +201,82 @@ function shouldCapture(url) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Credential redaction (SP-lsc.7) — mirrors src/format/redact.ts. Ported
+// rather than imported: this script is plain JS with no build step (same
+// reason registrableDomain() above is ported instead of imported), so the
+// two copies need to be kept in sync by hand if the redaction rules change.
+// ---------------------------------------------------------------------------
+const REDACTED = "[REDACTED]";
+const SECRET_BODY_KEY_SUBSTRINGS = [
+  "token", "password", "apikey", "secret", "authorization", "session", "bearer",
+];
+
+function isSecretBodyKey(key) {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return SECRET_BODY_KEY_SUBSTRINGS.some((s) => normalized.includes(s));
+}
+
+function redactJsonValue(value) {
+  if (Array.isArray(value)) return value.map(redactJsonValue);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, val] of Object.entries(value)) {
+      out[key] = isSecretBodyKey(key) ? REDACTED : redactJsonValue(val);
+    }
+    return out;
+  }
+  return value;
+}
+
+function looksFormEncoded(body) {
+  if (!body.includes("=")) return false;
+  return body.split("&").every((segment) => {
+    const eq = segment.indexOf("=");
+    if (eq <= 0) return false;
+    return /^[A-Za-z0-9_.\-%]+$/.test(segment.slice(0, eq));
+  });
+}
+
+function redactFormEncoded(body) {
+  try {
+    const params = new URLSearchParams(body);
+    let changed = false;
+    for (const key of [...params.keys()]) {
+      if (isSecretBodyKey(key)) {
+        params.set(key, REDACTED);
+        changed = true;
+      }
+    }
+    return changed ? params.toString() : body;
+  } catch {
+    return body;
+  }
+}
+
+/** Redact secret-looking fields from a captured request/response body
+ * string. Tries JSON first, falls back to a best-effort form-urlencoded
+ * pass; anything else is returned unchanged. */
+function redactBody(body) {
+  if (body === null || body === undefined || body === "") return body;
+
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed && typeof parsed === "object") {
+      return JSON.stringify(redactJsonValue(parsed));
+    }
+    return body;
+  } catch {
+    // Not JSON — fall through.
+  }
+
+  if (looksFormEncoded(body)) {
+    return redactFormEncoded(body);
+  }
+
+  return body;
+}
+
 function slugify(url) {
   try {
     const u = new URL(url);
@@ -263,6 +354,34 @@ function save() {
   }
 
   writeFileSync(join(outputDir, "summary.txt"), lines.join("\n") + "\n");
+
+  // Build and write manifest.json — same shape as CaptureManifest
+  // (src/format/types.ts) so `mockify list` (src/captures/store.ts) picks
+  // up target/timestamp for manual captures the same way it does for
+  // agent/MCP ones, and so `redaction` (SP-lsc.7) has a documented home.
+  const manifest = {
+    session: {
+      timestamp,
+      targetUrl: TARGET_URL,
+      hostFilter,
+      outputDir,
+      totalRequests: traffic.length,
+      totalScreenshots: screenshotCount,
+      pagesVisited: pageUrls.size,
+      consoleLogCount: consoleLogs.length,
+    },
+    redaction: REDACT,
+    trafficFile: "traffic.json",
+    consoleFile: "console.json",
+    screenshotFiles: readdirSync(screenshotDir)
+      .filter((f) => f.endsWith(".png"))
+      .sort()
+      .map((f) => join("screenshots", f)),
+    summaryFile: "summary.txt",
+    jsSourcesFile: "js-sources.json",
+  };
+  writeFileSync(join(outputDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+
   return sorted.length;
 }
 
@@ -386,6 +505,15 @@ async function main() {
             entry.responseBody = body;
           }
         } catch {}
+      }
+
+      // Redact before the entry ever lands in `traffic` (SP-lsc.7) — the
+      // periodic autosave below writes `traffic` straight to disk, so
+      // redacting only at final save() would leave a window where an
+      // autosaved traffic.json still holds raw values.
+      if (REDACT) {
+        entry.postData = redactBody(entry.postData);
+        entry.responseBody = redactBody(entry.responseBody);
       }
 
       traffic.push(entry);

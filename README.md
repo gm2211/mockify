@@ -29,10 +29,23 @@ captures/demo-grok/
 ├── traffic.json       # every request/response pair — replayed byte-for-byte
 ├── screenshots/        # one PNG per interaction step, in order
 ├── observations.json   # what the agent saw and decided at each step
-├── manifest.json       # session metadata: target URL, counts, timestamp
+├── manifest.json       # session metadata: target URL, counts, timestamp, redaction flag
 └── synthetic/
     └── index.json       # inferred endpoint templates + response shapes (loaded at replay)
 ```
+
+## captures/ — before you commit one
+
+A capture is a folder of raw traffic from a real, often-authenticated session — treat it like you would any other file that might hold credentials, because it can. `--storage-state <path|keychain:name>` (see [Agent capture & MCP](#agent-capture--mcp)) starts the browser already logged in, and whatever that session sends — bearer tokens, session cookies, API keys — can end up in a request or response body that gets recorded.
+
+By default, mockify redacts credential-looking values before `traffic.json` (or, for `cdp-capture.ts`, its header dump) is ever written to disk:
+
+- Request/response body fields whose key looks secret — `token`, `password`, `apiKey`/`api_key`, `secret`, `authorization`, `session`, `bearer` (case-insensitive, nested objects included) — have their value replaced with `"[REDACTED]"`. The key and the surrounding shape are preserved, so replay still works.
+- Wherever headers are captured (currently just the legacy `cdp-capture.ts` recorder — see the roadmap gap below), `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar credential-bearing header values get the same treatment.
+
+Every capture's `manifest.json` records whether redaction ran: `"redaction": true` (default) or `"redaction": false` (you passed `--no-redact`). Check that field — or just grep the capture — before pushing a `captures/` directory to a shared repo.
+
+`--no-redact` (agent and manual `mockify capture`, or `MOCKIFY_NO_REDACT=1` for any capture path, including `mockify mcp`'s `capture_start`) turns redaction off and writes raw values — only do this for a capture you're not going to commit, e.g. one you're inspecting locally to debug a replay mismatch.
 
 ## Expansion
 
@@ -92,7 +105,7 @@ npx mockify replay app-example-com
 
 ## Agent capture & MCP
 
-`mockify capture --url <url>` is agent-driven by default: a Claude agent (`src/agent/runner.ts`) drives a real Chromium browser, surveying the app's pages and then exercising its list/detail/create/update/delete flows, pagination, filters, and error states (`src/agent/prompts.ts`). **Authentication**: `ANTHROPIC_API_KEY`, a `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`), or an ambient `claude login` session — first one found wins. **Options**: `--name <name>` (default: slugified from `--url`), `--output <dir>` (bypasses naming entirely), `--headed`, `--storage-state <path|keychain:name>` / `--save-storage-state <path|keychain:name>`, `--timeout <seconds>`. **Manual fallback**: `--manual` opens a visible Chromium window for you to drive by hand — no API key needed. **Env**: `MOCKIFY_MAX_TURNS` (default 200), `MOCKIFY_MAX_BUDGET_USD` (default 5), `MOCKIFY_CAPTURE_HOST_FILTER`, `MOCKIFY_MODEL` (default `claude-opus-4-6`).
+`mockify capture --url <url>` is agent-driven by default: a Claude agent (`src/agent/runner.ts`) drives a real Chromium browser, surveying the app's pages and then exercising its list/detail/create/update/delete flows, pagination, filters, and error states (`src/agent/prompts.ts`). **Authentication**: `ANTHROPIC_API_KEY`, a `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`), or an ambient `claude login` session — first one found wins. **Options**: `--name <name>` (default: slugified from `--url`), `--output <dir>` (bypasses naming entirely), `--headed`, `--storage-state <path|keychain:name>` / `--save-storage-state <path|keychain:name>`, `--timeout <seconds>`, `--no-redact` (skip credential redaction — see [captures/ — before you commit one](#captures--before-you-commit-one)). **Manual fallback**: `--manual` opens a visible Chromium window for you to drive by hand — no API key needed. **Env**: `MOCKIFY_MAX_TURNS` (default 200), `MOCKIFY_MAX_BUDGET_USD` (default 5), `MOCKIFY_CAPTURE_HOST_FILTER`, `MOCKIFY_MODEL` (default `claude-opus-4-6`).
 
 `mockify mcp` starts a stdio [MCP](https://modelcontextprotocol.io) server exposing `capture_start`, `capture_finish`, `get_capture_guide`, and the same 13 `browser_*` tools as the built-in agent path — so grok, Codex, Claude Code, or any other MCP-capable agent can drive a capture session directly (register command shown at the top). `capture_start` takes the same `name`/`outputDir` as the CLI; `capture_finish` reports back the name it was saved under:
 

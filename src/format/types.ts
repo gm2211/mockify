@@ -130,6 +130,15 @@ export interface CaptureManifest {
   /** Session metadata. */
   session: CaptureSession;
 
+  /**
+   * Whether credential redaction (src/format/redact.ts) ran on this
+   * capture's request/response bodies — and header values, where headers
+   * are captured at all — before anything was written to disk. `false`
+   * means the capture was taken with `--no-redact` (or MOCKIFY_NO_REDACT)
+   * and may contain live tokens/cookies/API keys in plain text.
+   */
+  redaction: boolean;
+
   /** Path to traffic.json relative to the capture directory. */
   trafficFile: string;
 
