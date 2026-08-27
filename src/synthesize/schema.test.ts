@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { inferShape, synthesizeValue, hashSeed, mulberry32 } from './schema.js';
+import { inferShape, synthesizeValue, hashSeed, mulberry32, fixInvariantPairs } from './schema.js';
 import type { ResolvedParam, SynthContext } from './schema.js';
 
 test('inferShape: merges object keys across samples, marking sometimes-missing keys optional', () => {
@@ -114,6 +114,123 @@ test('synthesizeValue: bare "id" key matches the sole path param', () => {
   const ctx: SynthContext = { params, seed: hashSeed('GET /api/order/99') };
   const value = synthesizeValue(shape, ctx) as { id: unknown };
   assert.equal(value.id, 99);
+});
+
+// ---------------------------------------------------------------------------
+// SP-lsc.4 — whole-object base sampling preserves intra-object invariants.
+//
+// Real-world bug: GET /api/report/room/9 synthesized start=2026-04-11 with
+// end=2026-02-04 (end before start) because the old implementation sampled
+// each field independently from its own observed pool, so "start" from one
+// captured booking could pair with "end" from an unrelated one. No real
+// backend emits an inverted range, and range-validating consumers broke on
+// it.
+// ---------------------------------------------------------------------------
+
+test('SP-lsc.4: synthesized start/end never violates start<=end (demo-grok bug class)', () => {
+  const bodies = [
+    JSON.stringify({ roomid: 1, start: '2026-01-01', end: '2026-01-05' }),
+    JSON.stringify({ roomid: 2, start: '2026-02-10', end: '2026-02-20' }),
+    JSON.stringify({ roomid: 3, start: '2026-04-11', end: '2026-04-15' }),
+    JSON.stringify({ roomid: 4, start: '2026-06-01', end: '2026-06-02' }),
+    JSON.stringify({ roomid: 5, start: '2026-02-04', end: '2026-02-06' }),
+  ];
+  const shape = inferShape(bodies);
+  const params: ResolvedParam[] = [{ name: 'p3', value: '9', resourceNoun: 'room' }];
+
+  for (let i = 0; i < 300; i++) {
+    const ctx: SynthContext = { params, seed: hashSeed(`GET /api/report/room/9#${i}`) };
+    const value = synthesizeValue(shape, ctx) as { start: string; end: string };
+    assert.ok(
+      Date.parse(value.start) <= Date.parse(value.end),
+      `expected start (${value.start}) <= end (${value.end})`
+    );
+  }
+});
+
+test('SP-lsc.4: whole-object coherence — every synthesized object matches one observed base exactly (no params to substitute)', () => {
+  const samples: Array<{ id: number; category: string; label: string }> = [
+    { id: 1, category: 'A', label: 'alpha' },
+    { id: 2, category: 'B', label: 'beta' },
+    { id: 3, category: 'C', label: 'gamma' },
+  ];
+  const bodies = samples.map((s) => JSON.stringify(s));
+  const shape = inferShape(bodies);
+
+  for (let i = 0; i < 100; i++) {
+    const ctx: SynthContext = { params: [], seed: hashSeed(`probe-${i}`) };
+    const value = synthesizeValue(shape, ctx) as { id: number; category: string; label: string };
+    const matchesSomeSample = samples.some(
+      (s) => s.id === value.id && s.category === value.category && s.label === value.label
+    );
+    assert.ok(matchesSomeSample, `expected ${JSON.stringify(value)} to exactly match one observed sample`);
+  }
+});
+
+test('SP-lsc.4: whole-object coherence survives id substitution — non-id fields still come from the same base', () => {
+  const samples: Array<{ roomid: number; category: string; label: string }> = [
+    { roomid: 1, category: 'A', label: 'alpha' },
+    { roomid: 2, category: 'B', label: 'beta' },
+    { roomid: 3, category: 'C', label: 'gamma' },
+  ];
+  const bodies = samples.map((s) => JSON.stringify(s));
+  const shape = inferShape(bodies);
+  const params: ResolvedParam[] = [{ name: 'p2', value: '999', resourceNoun: 'room' }];
+
+  for (let i = 0; i < 100; i++) {
+    const ctx: SynthContext = { params, seed: hashSeed(`GET /api/room/999#${i}`) };
+    const value = synthesizeValue(shape, ctx) as { roomid: number; category: string; label: string };
+    assert.equal(value.roomid, 999, 'the id field should be substituted from the request');
+    const matchesSomeSampleModuloId = samples.some(
+      (s) => s.category === value.category && s.label === value.label
+    );
+    assert.ok(
+      matchesSomeSampleModuloId,
+      `expected {category, label} of ${JSON.stringify(value)} to match one observed base, modulo the substituted id`
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SP-lsc.4 direction (b) — invariant-pair post-fix safety net.
+// ---------------------------------------------------------------------------
+
+test('fixInvariantPairs: swaps an inverted start/end date pair back into order', () => {
+  const obj = { roomid: 9, start: '2026-04-11', end: '2026-02-04' };
+  const fixed = fixInvariantPairs({ ...obj });
+  assert.equal(fixed.start, '2026-02-04');
+  assert.equal(fixed.end, '2026-04-11');
+});
+
+test('fixInvariantPairs: swaps an inverted numeric min/max pair back into order', () => {
+  const fixed = fixInvariantPairs({ minPrice: 100, maxPrice: 10 });
+  assert.equal(fixed.minPrice, 10);
+  assert.equal(fixed.maxPrice, 100);
+});
+
+test('fixInvariantPairs: leaves an already-ordered pair untouched', () => {
+  const obj = { from: 5, to: 12 };
+  const fixed = fixInvariantPairs({ ...obj });
+  assert.equal(fixed.from, 5);
+  assert.equal(fixed.to, 12);
+});
+
+test('fixInvariantPairs: leaves unrelated keys alone (no false-positive pairing)', () => {
+  const obj = { minA: 5, maxB: 1, name: 'unchanged' };
+  const fixed = fixInvariantPairs({ ...obj });
+  assert.deepEqual(fixed, obj);
+});
+
+test('fixInvariantPairs: skips a pair when either side is not comparable', () => {
+  const obj = { start: 'not-a-date', end: '2026-01-01' };
+  const fixed = fixInvariantPairs({ ...obj });
+  assert.deepEqual(fixed, obj);
+});
+
+test('fixInvariantPairs: matches createdAt/updatedAt case-insensitively', () => {
+  const fixed = fixInvariantPairs({ createdAt: '2026-05-01', updatedAt: '2026-01-01' });
+  assert.equal(fixed.createdAt, '2026-01-01');
+  assert.equal(fixed.updatedAt, '2026-05-01');
 });
 
 test('mulberry32: deterministic sequence for a given seed', () => {

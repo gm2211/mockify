@@ -22,6 +22,13 @@
 export interface ObjectShape {
   type: 'object';
   keys: Record<string, { shape: Shape; optional: boolean }>;
+  /** Deduped, capped set of the whole raw objects observed at this position
+   * in the document tree (SP-lsc.4). Synthesis draws one of these as a base
+   * and copies its fields over wholesale — rather than sampling each field
+   * independently from its own per-key pool — so correlated fields (e.g. a
+   * start/end date pair, or an id that only ever appears alongside a
+   * matching name) stay coherent in the synthesized output. */
+  samples: Record<string, unknown>[];
 }
 
 export interface ArrayShape {
@@ -92,7 +99,7 @@ function mergeValues(values: unknown[]): Shape {
         optional: present.length < objects.length,
       };
     }
-    return { type: 'object', keys };
+    return { type: 'object', keys, samples: dedupCapped(objects) as Record<string, unknown>[] };
   }
 
   // Primitives (possibly a mix of types across samples — pick the most
@@ -225,6 +232,80 @@ function coerceToObservedType(value: string, shape: Shape): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// Invariant-pair safety net (SP-lsc.4, direction b)
+//
+// Whole-object base sampling (below) is the primary fix for correlated
+// fields, but a couple of paths still bypass it: the no-samples fallback,
+// and a param substitution overwriting one half of a pair (e.g. the request
+// touches an id that happens to share a name with one side of a min/max
+// pair). fixInvariantPairs() is a cheap post-hoc check that catches the
+// common case anyway — well-known field-pair names, both sides parseable as
+// the same kind of comparable (date or number) — and swaps them back into
+// order rather than leaving an inverted range in the response.
+// ---------------------------------------------------------------------------
+
+/** [lower-bound token, upper-bound token], matched as substrings of the
+ * normalized (lowercased, separators stripped) key name. */
+const INVARIANT_PAIR_TOKENS: Array<[string, string]> = [
+  ['start', 'end'],
+  ['from', 'to'],
+  ['min', 'max'],
+  ['createdat', 'updatedat'],
+];
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** Find same-object key pairs whose names match a known lower/upper token
+ * pair (e.g. "startDate"/"endDate", "start_time"/"end_time", "minPrice"/
+ * "maxPrice", "createdAt"/"updatedAt") — case-insensitively, ignoring
+ * separators. */
+function findInvariantPairs(keys: string[]): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
+  for (const key of keys) {
+    const norm = normalizeKey(key);
+    for (const [lo, hi] of INVARIANT_PAIR_TOKENS) {
+      if (!norm.includes(lo)) continue;
+      const counterpartNorm = norm.replace(lo, hi);
+      const counterpart = keys.find((k) => k !== key && normalizeKey(k) === counterpartNorm);
+      if (counterpart) pairs.push([key, counterpart]);
+    }
+  }
+  return pairs;
+}
+
+/** A value is "comparable" for invariant-pair purposes if it's a finite
+ * number, or a string that parses as a date — the two kinds of pool values
+ * these field-name conventions actually hold. */
+function comparablePairValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const t = Date.parse(value);
+    if (!Number.isNaN(t)) return t;
+  }
+  return null;
+}
+
+/** Post-fix a synthesized object so well-known lower/upper field pairs
+ * (start/end, from/to, min/max, createdAt/updatedAt) never come out
+ * inverted — swapping the two values back into order when both parse as the
+ * same kind of comparable. Mutates and returns `obj` for convenience. */
+export function fixInvariantPairs(obj: Record<string, unknown>): Record<string, unknown> {
+  for (const [loKey, hiKey] of findInvariantPairs(Object.keys(obj))) {
+    const loVal = comparablePairValue(obj[loKey]);
+    const hiVal = comparablePairValue(obj[hiKey]);
+    if (loVal === null || hiVal === null) continue;
+    if (loVal > hiVal) {
+      const tmp = obj[loKey];
+      obj[loKey] = obj[hiKey];
+      obj[hiKey] = tmp;
+    }
+  }
+  return obj;
+}
+
+// ---------------------------------------------------------------------------
 // Synthesis
 // ---------------------------------------------------------------------------
 
@@ -260,6 +341,55 @@ function synthesizeNumber(rng: () => number, pool: unknown[]): number {
   return allInts ? Math.round(value) : value;
 }
 
+/** Copy `value` (a piece of one whole observed base object) into the
+ * synthesized output, recursing into nested objects/arrays so the whole
+ * subtree stays exactly as it was jointly observed, and applying param
+ * substitution at every key along the way (a nested id can match a request
+ * param just as a top-level one can). Primitives are returned verbatim —
+ * no re-sampling from a pool, which is the whole point: every field in the
+ * output traces back to one coherent observed object. */
+function copyFromBase(value: unknown, shape: Shape, ctx: SynthContext): unknown {
+  if (shape.type === 'object' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return synthesizeObjectFromBase(shape, value as Record<string, unknown>, ctx);
+  }
+  if (shape.type === 'array' && Array.isArray(value)) {
+    return value.map((el) => copyFromBase(el, shape.element, ctx));
+  }
+  return value;
+}
+
+/** Build a synthesized object from one chosen whole observed `base`,
+ * substituting request-param matches per key and otherwise copying the
+ * base's own fields verbatim (via copyFromBase). A key present in the
+ * shape's merged key set (pooled across *all* observed samples) but absent
+ * from this particular base is either omitted (if optional — mirroring
+ * this base's own shape) or falls back to independent per-field synthesis
+ * (if required, which should be rare: a required key is present in every
+ * sample by definition, this base included). */
+function synthesizeObjectFromBase(
+  shape: ObjectShape,
+  base: Record<string, unknown>,
+  ctx: SynthContext
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, { shape: valueShape, optional }] of Object.entries(shape.keys)) {
+    const matched = paramForKey(key, ctx.params);
+    if (matched) {
+      result[key] = coerceToObservedType(matched.value, valueShape);
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(base, key)) {
+      result[key] = copyFromBase(base[key], valueShape, ctx);
+      continue;
+    }
+    if (!optional) {
+      result[key] = synthesizeValue(valueShape, ctx, key);
+    }
+    // else: optional and absent from this base — omit, mirroring the base.
+  }
+  return fixInvariantPairs(result);
+}
+
 /** Draw a concrete value for `shape`, substituting request params where a
  * key semantically matches one (e.g. "roomid" for /api/room/{p2}). */
 export function synthesizeValue(shape: Shape, ctx: SynthContext, keyName?: string): unknown {
@@ -272,12 +402,27 @@ export function synthesizeValue(shape: Shape, ctx: SynthContext, keyName?: strin
 
   switch (shape.type) {
     case 'object': {
+      // Whole-object base sampling (SP-lsc.4): draw one whole observed
+      // object and copy its fields over, substituting only keys that match
+      // a request param/id. Sampling each field independently from its own
+      // pool (the old behavior, still used as a fallback below) breaks
+      // intra-object relationships — e.g. a synthesized {start, end} pair
+      // could mix a "start" from one booking with an "end" from an earlier
+      // one, producing end < start, which no real backend would emit.
+      if (shape.samples && shape.samples.length > 0) {
+        const base = pick(rng, shape.samples);
+        return synthesizeObjectFromBase(shape, base, ctx);
+      }
+      // Fallback for a shape with no captured whole-object samples (should
+      // not normally happen — every object-typed shape is built from at
+      // least one observed sample — but kept for robustness, e.g. a
+      // hand-built Shape or a pre-SP-lsc.4 index.json missing `samples`).
       const result: Record<string, unknown> = {};
       for (const [key, { shape: valueShape, optional }] of Object.entries(shape.keys)) {
         if (optional && rng() < 0.15) continue; // occasionally omit, mirroring the capture
         result[key] = synthesizeValue(valueShape, ctx, key);
       }
-      return result;
+      return fixInvariantPairs(result);
     }
     case 'array': {
       const span = shape.maxLength - shape.minLength;
