@@ -97,13 +97,19 @@ function noSessionResult(action: string): ToolResult {
 // capture_start — launch a headless browser session
 // ---------------------------------------------------------------------------
 
-async function launchCaptureSession(url: string, outputDir: string, name: string): Promise<McpCaptureSession> {
+async function launchCaptureSession(
+  url: string,
+  outputDir: string,
+  name: string,
+  redact?: boolean,
+): Promise<McpCaptureSession> {
   const { chromium } = await import('playwright');
 
   const collector = new CaptureCollector({
     outputDir,
     targetUrl: url,
     hostFilter: new URL(url).hostname,
+    redact,
   });
 
   const browser = await chromium.launch({ headless: true });
@@ -135,7 +141,7 @@ async function launchCaptureSession(url: string, outputDir: string, name: string
 
 async function handleCaptureStart(
   store: SessionStore,
-  args: { url: string; outputDir?: string; name?: string },
+  args: { url: string; outputDir?: string; name?: string; redact?: boolean },
 ): Promise<ToolResult> {
   try {
     new URL(args.url);
@@ -166,7 +172,7 @@ async function handleCaptureStart(
   fs.mkdirSync(outputDir, { recursive: true });
 
   try {
-    const session = await launchCaptureSession(args.url, outputDir, name);
+    const session = await launchCaptureSession(args.url, outputDir, name, args.redact);
     store.set(session);
     const title = await session.page.title().catch(() => '');
     return ok({ outputDir, name, title, url: session.page.url() });
@@ -465,8 +471,9 @@ const SESSION_TOOL_DEFS: ToolDef[] = [
       url: z.string().describe('Target URL to open and capture'),
       name: z.string().optional().describe('Name to save the capture under (default: slugified from the URL, e.g. "automationintesting-online"). Ignored when outputDir is given.'),
       outputDir: z.string().optional().describe('Output directory, bypassing name-based capture storage entirely (default: captures/<name> under cwd)'),
+      redact: z.boolean().optional().describe('Redact credential-bearing body fields (token/password/apiKey/secret/session/bearer, nested included) before writing traffic.json. Default true — pass false only if you specifically need raw, unredacted values on disk.'),
     },
-    handler: (store: SessionStore) => (args: { url: string; outputDir?: string; name?: string }) => handleCaptureStart(store, args),
+    handler: (store: SessionStore) => (args: { url: string; outputDir?: string; name?: string; redact?: boolean }) => handleCaptureStart(store, args),
   },
   {
     name: 'capture_finish',

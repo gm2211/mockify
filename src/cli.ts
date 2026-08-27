@@ -6,7 +6,7 @@
  *   mockify capture --url <url> [--name <name>] [--output <dir>] [--headed]
  *                    [--manual] [--storage-state <path|keychain:name>]
  *                    [--save-storage-state <path|keychain:name>]
- *                    [--timeout <seconds>]
+ *                    [--timeout <seconds>] [--no-redact]
  *     Agent mode (default): drives a Claude agent (src/agent/runner.ts) that
  *     explores the target and records real traffic/console/screenshots.
  *     `--manual` instead runs the browse-and-capture recorder
@@ -16,6 +16,10 @@
  *     wins, otherwise the name defaults to a slug of the target URL's
  *     hostname (e.g. `automationintesting-online`). `--output <dir>` bypasses
  *     naming entirely and writes straight to `<dir>`.
+ *     Credential-bearing body fields (token/password/apiKey/secret/session/
+ *     bearer, nested included) are redacted before traffic.json is written
+ *     (src/format/redact.ts); `--no-redact` disables this and writes raw
+ *     values — see the captures/ section in README.md before committing one.
  *
  *   mockify list [--json]
  *     Lists every saved capture (src/captures/store.ts) as a table: name,
@@ -141,6 +145,7 @@ function printUsage(): void {
   console.error('  --storage-state <path|keychain:name>       Start authenticated from a saved storage state');
   console.error('  --save-storage-state <path|keychain:name>  Persist cookies/localStorage after capture');
   console.error('  --timeout <seconds>            Wall-clock budget for the agent run');
+  console.error('  --no-redact                    Write raw, unredacted body values to traffic.json (default: redacted)');
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +336,11 @@ function runManualCapture(url: string, args: string[]): void {
     const allocated = allocateCaptureDir(url, nameArg);
     env.CAPTURE_EXACT_OUTPUT_DIR = allocated.dir;
   }
+  // --no-redact escape hatch (see src/format/redact.ts): forwarded to the
+  // spawned recorder as an env var since it's a separate process.
+  if (hasFlag(args, '--no-redact')) {
+    env.MOCKIFY_NO_REDACT = '1';
+  }
 
   const child = spawn(process.execPath, [recorderPath], {
     stdio: 'inherit',
@@ -374,6 +384,16 @@ async function runAgentCapture(url: string, args: string[]): Promise<void> {
   const storageState = parseFlag(args, '--storage-state');
   const saveStorageState = parseFlag(args, '--save-storage-state');
   const timeoutArg = parseFlag(args, '--timeout');
+
+  // --no-redact escape hatch (see src/format/redact.ts). The agent-driven
+  // capture path builds its CaptureCollector inside src/agent/runner.ts,
+  // which has no `redact` option to pass through explicitly — the env var
+  // is read by CaptureCollector's own default resolution instead, and since
+  // runCaptureAgent() runs in this same process (no spawn), setting it here
+  // before that call has the same effect as passing an explicit option.
+  if (hasFlag(args, '--no-redact')) {
+    process.env.MOCKIFY_NO_REDACT = '1';
+  }
 
   let timeoutMs: number | undefined;
   if (timeoutArg !== undefined) {

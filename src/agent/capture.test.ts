@@ -80,8 +80,10 @@ function tmpOutputDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mockify-capture-'));
 }
 
-/** Minimal fake Playwright Route capturing which methods were invoked. */
-function fakeRoute(url: string, method: string) {
+/** Minimal fake Playwright Route capturing which methods were invoked.
+ * `body.postData`/`body.responseBody` let tests exercise the redaction
+ * choke point without a real browser. */
+function fakeRoute(url: string, method: string, body?: { postData?: string | null; responseBody?: string }) {
   const calls: { fetch: number; fulfill: unknown[]; abort: unknown[]; continue: number } = {
     fetch: 0,
     fulfill: [],
@@ -92,11 +94,15 @@ function fakeRoute(url: string, method: string) {
     request: () => ({
       url: () => url,
       method: () => method,
-      postData: () => null,
+      postData: () => body?.postData ?? null,
     }),
     fetch: async () => {
       calls.fetch++;
-      return { status: () => 200, headers: () => ({ 'content-type': 'application/json' }), text: async () => '{}' };
+      return {
+        status: () => 200,
+        headers: () => ({ 'content-type': 'application/json' }),
+        text: async () => body?.responseBody ?? '{}',
+      };
     },
     fulfill: async (opts: unknown) => {
       calls.fulfill.push(opts);
@@ -162,4 +168,154 @@ test('save() writes traffic.json, console.json, summary.txt, and manifest.json',
   assert.equal(manifest.session.consoleLogCount, 1);
   assert.equal(manifest.trafficFile, 'traffic.json');
   assert.equal(manifest.consoleFile, 'console.json');
+});
+
+// ---------------------------------------------------------------------------
+// Credential redaction (SP-lsc.7) — see also src/format/redact.test.ts for
+// the redaction rules themselves. These tests cover the choke point: does
+// CaptureCollector actually apply it, on ingest, to everything that ends up
+// on disk?
+// ---------------------------------------------------------------------------
+
+test('redaction (default on): addTraffic() redacts secret-looking body keys, including nested, before traffic.json is written', () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+  collector.addTraffic({
+    url: 'https://x.test/api/login',
+    method: 'POST',
+    postData: JSON.stringify({ username: 'alice', password: 'hunter2' }),
+    status: 200,
+    contentType: 'application/json',
+    ts: 1,
+    responseBody: JSON.stringify({
+      accessToken: 'abc123',
+      user: { id: 1, credentials: { apiKey: 'sk-live-xyz' } },
+    }),
+  });
+
+  collector.save();
+  const traffic = JSON.parse(fs.readFileSync(path.join(dir, 'traffic.json'), 'utf8'));
+
+  const postData = JSON.parse(traffic[0].postData);
+  assert.equal(postData.username, 'alice');
+  assert.equal(postData.password, '[REDACTED]');
+
+  const responseBody = JSON.parse(traffic[0].responseBody);
+  assert.equal(responseBody.accessToken, '[REDACTED]');
+  assert.equal(responseBody.user.id, 1);
+  assert.equal(responseBody.user.credentials.apiKey, '[REDACTED]');
+});
+
+test('redaction (default on): getTraffic() also reflects redacted values, since redaction happens at ingest', () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+  collector.addTraffic({
+    url: 'https://x.test/api/widgets',
+    method: 'GET',
+    postData: null,
+    status: 200,
+    contentType: 'application/json',
+    ts: 1,
+    responseBody: JSON.stringify({ token: 'secret-value' }),
+  });
+
+  const traffic = collector.getTraffic();
+  assert.equal(JSON.parse(traffic[0].responseBody!).token, '[REDACTED]');
+});
+
+test('redact: false (the --no-redact escape hatch) writes raw, unredacted values', () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test', redact: false });
+  collector.addTraffic({
+    url: 'https://x.test/api/login',
+    method: 'POST',
+    postData: JSON.stringify({ password: 'hunter2' }),
+    status: 200,
+    contentType: 'application/json',
+    ts: 1,
+    responseBody: JSON.stringify({ accessToken: 'abc123' }),
+  });
+
+  collector.save();
+  const traffic = JSON.parse(fs.readFileSync(path.join(dir, 'traffic.json'), 'utf8'));
+  assert.equal(JSON.parse(traffic[0].postData).password, 'hunter2');
+  assert.equal(JSON.parse(traffic[0].responseBody).accessToken, 'abc123');
+});
+
+test('MOCKIFY_NO_REDACT=1 disables redaction when no explicit `redact` option is given', () => {
+  const orig = process.env.MOCKIFY_NO_REDACT;
+  process.env.MOCKIFY_NO_REDACT = '1';
+  try {
+    const dir = tmpOutputDir();
+    const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+    collector.addTraffic({
+      url: 'https://x.test/api/login',
+      method: 'POST',
+      postData: JSON.stringify({ password: 'hunter2' }),
+      status: 200,
+      contentType: 'application/json',
+      ts: 1,
+      responseBody: null,
+    });
+    const traffic = collector.getTraffic();
+    assert.equal(JSON.parse(traffic[0].postData!).password, 'hunter2');
+  } finally {
+    if (orig === undefined) delete process.env.MOCKIFY_NO_REDACT;
+    else process.env.MOCKIFY_NO_REDACT = orig;
+  }
+});
+
+test('an explicit `redact: true` option wins over MOCKIFY_NO_REDACT=1', () => {
+  const orig = process.env.MOCKIFY_NO_REDACT;
+  process.env.MOCKIFY_NO_REDACT = '1';
+  try {
+    const dir = tmpOutputDir();
+    const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test', redact: true });
+    collector.addTraffic({
+      url: 'https://x.test/api/login',
+      method: 'POST',
+      postData: JSON.stringify({ password: 'hunter2' }),
+      status: 200,
+      contentType: 'application/json',
+      ts: 1,
+      responseBody: null,
+    });
+    const traffic = collector.getTraffic();
+    assert.equal(JSON.parse(traffic[0].postData!).password, '[REDACTED]');
+  } finally {
+    if (orig === undefined) delete process.env.MOCKIFY_NO_REDACT;
+    else process.env.MOCKIFY_NO_REDACT = orig;
+  }
+});
+
+test('manifest.json records redaction: true by default and redaction: false with the escape hatch', () => {
+  const dirOn = tmpOutputDir();
+  const onCollector = new CaptureCollector({ outputDir: dirOn, targetUrl: 'https://x.test' });
+  const onManifest = onCollector.save();
+  assert.equal(onManifest.redaction, true);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dirOn, 'manifest.json'), 'utf8')).redaction, true);
+
+  const dirOff = tmpOutputDir();
+  const offCollector = new CaptureCollector({ outputDir: dirOff, targetUrl: 'https://x.test', redact: false });
+  const offManifest = offCollector.save();
+  assert.equal(offManifest.redaction, false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dirOff, 'manifest.json'), 'utf8')).redaction, false);
+});
+
+test('redaction also applies to entries recorded via attachToContext()\'s route interception, not just addTraffic()', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test', hostFilter: 'x.test' });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://x.test/api/login', 'POST', {
+    postData: JSON.stringify({ password: 'hunter2' }),
+    responseBody: JSON.stringify({ token: 'abc123' }),
+  });
+  await getHandler()(route);
+
+  const traffic = collector.getTraffic();
+  assert.equal(traffic.length, 1);
+  assert.equal(JSON.parse(traffic[0].postData!).password, '[REDACTED]');
+  assert.equal(JSON.parse(traffic[0].responseBody!).token, '[REDACTED]');
 });

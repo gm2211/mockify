@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { BrowserContext, Page } from 'playwright';
 import type { CapturedTraffic, CapturedConsoleEntry, CaptureManifest } from '../format/types.js';
+import { redactTrafficEntry, envDisablesRedaction } from '../format/redact.js';
 
 const STATIC_EXT = new Set([
   '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg',
@@ -117,6 +118,17 @@ export interface CaptureCollectorOptions {
   outputDir: string;
   targetUrl: string;
   hostFilter?: string;
+  /**
+   * Whether to redact credential-bearing body fields (and header values,
+   * where headers are captured) before an entry ever lands in `this.traffic`
+   * — see src/format/redact.ts. Defaults to `true` unless overridden by the
+   * MOCKIFY_NO_REDACT env var (the `--no-redact` CLI flag sets that env var
+   * rather than passing this option directly, since the agent-driven
+   * capture path constructs its CaptureCollector inside runner.ts without
+   * exposing this field). Pass `false` explicitly to opt a specific caller
+   * out regardless of the env var (used by tests).
+   */
+  redact?: boolean;
 }
 
 export class CaptureCollector {
@@ -128,6 +140,7 @@ export class CaptureCollector {
   private targetUrl: string;
   private hostFilter: string;
   private startTime: string;
+  private redact: boolean;
 
   constructor(options: CaptureCollectorOptions) {
     this.outputDir = path.resolve(options.outputDir);
@@ -135,6 +148,7 @@ export class CaptureCollector {
     this.targetUrl = options.targetUrl;
     this.hostFilter = options.hostFilter ?? '';
     this.startTime = new Date().toISOString();
+    this.redact = options.redact ?? !envDisablesRedaction();
 
     fs.mkdirSync(this.screenshotDir, { recursive: true });
   }
@@ -181,7 +195,7 @@ export class CaptureCollector {
           }
         }
 
-        this.traffic.push(entry);
+        this.traffic.push(this.redact ? redactTrafficEntry(entry) : entry);
       }
     });
   }
@@ -214,9 +228,10 @@ export class CaptureCollector {
     return filepath;
   }
 
-  /** Record traffic entries manually (e.g. from hook calls). */
+  /** Record traffic entries manually (e.g. from hook calls). Redacted the
+   * same way as intercepted traffic — see the constructor's `redact` option. */
   addTraffic(entry: CapturedTraffic): void {
-    this.traffic.push(entry);
+    this.traffic.push(this.redact ? redactTrafficEntry(entry) : entry);
   }
 
   /** Record console log entries manually (e.g. from resumed sessions). */
@@ -298,6 +313,7 @@ export class CaptureCollector {
         })).size,
         consoleLogCount: this.consoleLogs.length,
       },
+      redaction: this.redact,
       trafficFile: 'traffic.json',
       consoleFile: 'console.json',
       screenshotFiles,

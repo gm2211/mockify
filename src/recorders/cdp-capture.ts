@@ -31,6 +31,7 @@
 import CDP from 'chrome-remote-interface';
 import * as fs from 'fs';
 import * as path from 'path';
+import { redactHeaders, redactBodyString, envDisablesRedaction } from '../format/redact.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -40,6 +41,11 @@ const CDP_PORT = parseInt(process.env.CDP_PORT ?? '9222', 10);
 const HOST_FILTER = process.env.CAPTURE_HOST_FILTER ?? '';
 const MAX_BODY_BYTES = parseInt(process.env.CDP_MAX_BODY_BYTES ?? String(1024 * 1024), 10);
 const OUTPUT_DIR = path.resolve(process.cwd(), process.env.CAPTURE_OUTPUT_DIR ?? 'captures');
+// --no-redact escape hatch (SP-lsc.7) — see src/format/redact.ts. This
+// recorder captures full request/response headers (Authorization, Cookie,
+// Set-Cookie, ...), unlike the other capture paths, so redaction here
+// matters most.
+const REDACT = !(process.argv.includes('--no-redact') || envDisablesRedaction());
 
 if (!HOST_FILTER) {
   console.warn(
@@ -207,6 +213,16 @@ async function main(): Promise<void> {
       } catch {
         // Body may not be available for redirects or errors
       }
+    }
+
+    // Redact before the entry ever lands in `capturedRequests` (SP-lsc.7) —
+    // this is the choke point every entry passes through on its way to
+    // saveAndExit()'s writeFileSync.
+    if (REDACT) {
+      captured.requestHeaders = redactHeaders(captured.requestHeaders) ?? {};
+      captured.responseHeaders = redactHeaders(captured.responseHeaders) ?? {};
+      captured.postData = redactBodyString(captured.postData ?? null) ?? undefined;
+      captured.responseBody = redactBodyString(captured.responseBody ?? null) ?? undefined;
     }
 
     capturedRequests.push(captured);
