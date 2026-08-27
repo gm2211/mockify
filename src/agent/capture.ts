@@ -136,6 +136,13 @@ export interface CaptureCollectorOptions {
 export class CaptureCollector {
   private traffic: CapturedTraffic[] = [];
   private consoleLogs: CapturedConsoleEntry[] = [];
+  // Used only to number the next screenshot's filename (see screenshot()
+  // below). NOT the source of truth for how many screenshots exist —
+  // save() derives that by reading the screenshots/ directory, since this
+  // counter can drift from what's actually on disk (e.g. two overlapping
+  // screenshot() calls racing to the same index, or the writer process
+  // being interrupted after this increments but before the caller's
+  // continuation observes it).
   private screenshotCount = 0;
   private outputDir: string;
   private screenshotDir: string;
@@ -308,7 +315,7 @@ export class CaptureCollector {
       `Target: ${this.targetUrl}`,
       `Total requests: ${this.traffic.length}`,
       `Unique endpoints: ${sorted.length}`,
-      `Screenshots: ${this.screenshotCount}`,
+      `Screenshots: ${screenshotFiles.length}`,
       `Console logs: ${this.consoleLogs.length}`,
       '',
       ...sorted.map((s) => `${s.method.padEnd(7)} ${String(s.status).padEnd(7)} ${s.url}`),
@@ -323,7 +330,14 @@ export class CaptureCollector {
         hostFilter: this.hostFilter,
         outputDir: this.outputDir,
         totalRequests: this.traffic.length,
-        totalScreenshots: this.screenshotCount,
+        // Derived from the enumerated screenshot files on disk (below),
+        // not from an in-memory counter — a counter incremented on every
+        // screenshot() call can overstate reality when two calls race to
+        // the same index (one write superseding/overwriting the other) or
+        // when other bookkeeping drifts from what actually got written.
+        // The files on disk are the only thing that can't disagree with
+        // itself.
+        totalScreenshots: screenshotFiles.length,
         pagesVisited: new Set(this.traffic.filter((t) => t.method === 'GET').map((t) => {
           try { return new URL(t.url).pathname; } catch { return t.url; }
         })).size,

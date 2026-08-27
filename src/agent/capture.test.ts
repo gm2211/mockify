@@ -4,6 +4,7 @@ import { shouldCapture, registrableDomain, CaptureCollector } from './capture.js
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { Page } from 'playwright';
 
 test('registrableDomain: strips subdomains down to the registrable domain', () => {
   assert.equal(registrableDomain('www.example.com'), 'example.com');
@@ -429,6 +430,110 @@ test('redact: false (the --no-redact escape hatch) leaves captured headers, incl
   const traffic = collector.getTraffic();
   assert.equal(traffic[0].requestHeaders?.authorization, 'Bearer super-secret-token');
   assert.equal(traffic[0].responseHeaders?.['set-cookie'], 'session=real-value; Path=/');
+});
+
+// ---------------------------------------------------------------------------
+// Screenshot count trustworthiness (SP-lsc.6) — manifest.session.totalScreenshots
+// must always equal manifest.screenshotFiles.length (and the real file count
+// on disk), even when some screenshot() calls fail to write or race each
+// other and overwrite the same file.
+// ---------------------------------------------------------------------------
+
+/** Fake Playwright Page whose screenshot() either writes a real (tiny) file
+ * to `path` or rejects, per `behavior`. `url()` returns a fixed page URL. */
+function fakePage(behavior: (opts: { path: string }) => Promise<void>): Page {
+  return {
+    url: () => 'https://x.test/page',
+    screenshot: behavior,
+  } as unknown as Page;
+}
+
+test('screenshot(): totalScreenshots matches screenshotFiles.length and the real on-disk count after an all-successes run', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+  const page = fakePage(async ({ path: p }) => {
+    fs.writeFileSync(p, 'fake-png');
+  });
+
+  await collector.screenshot(page);
+  await collector.screenshot(page);
+  await collector.screenshot(page);
+
+  const manifest = collector.save();
+  const onDisk = fs.readdirSync(path.join(dir, 'screenshots')).filter((f) => f.endsWith('.png'));
+
+  assert.equal(manifest.screenshotFiles.length, 3);
+  assert.equal(onDisk.length, 3);
+  assert.equal(manifest.session.totalScreenshots, manifest.screenshotFiles.length);
+  assert.equal(manifest.session.totalScreenshots, onDisk.length);
+});
+
+test('screenshot(): a failed write is not counted — totalScreenshots reflects only files actually written', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+
+  const okPage = fakePage(async ({ path: p }) => {
+    fs.writeFileSync(p, 'fake-png');
+  });
+  const failingPage = fakePage(async () => {
+    throw new Error('simulated Playwright screenshot failure');
+  });
+
+  await collector.screenshot(okPage);
+  await collector.screenshot(failingPage); // fails — must not inflate the count
+  await collector.screenshot(okPage);
+
+  const manifest = collector.save();
+  const onDisk = fs.readdirSync(path.join(dir, 'screenshots')).filter((f) => f.endsWith('.png'));
+
+  assert.equal(onDisk.length, 2);
+  assert.equal(manifest.screenshotFiles.length, 2);
+  assert.equal(manifest.session.totalScreenshots, 2);
+  assert.equal(manifest.session.totalScreenshots, manifest.screenshotFiles.length);
+});
+
+test('screenshot(): overlapping calls that race to the same filename (one write superseding the other) still report a count that matches disk, not the number of attempts', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+
+  // Both calls read the same pre-increment index before either of their
+  // page.screenshot() awaits resolves, so they write the same filename —
+  // reproducing the "superseded write" scenario from SP-lsc.6 (demo-grok:
+  // 47 reported vs 39 files on disk) without needing real concurrency.
+  const page = fakePage(async ({ path: p }) => {
+    await new Promise((r) => setTimeout(r, 5));
+    fs.writeFileSync(p, 'fake-png');
+  });
+
+  await Promise.all([collector.screenshot(page), collector.screenshot(page)]);
+
+  const manifest = collector.save();
+  const onDisk = fs.readdirSync(path.join(dir, 'screenshots')).filter((f) => f.endsWith('.png'));
+
+  // Only one file exists (the second write overwrote the first), and the
+  // reported total must agree with that — not with the two attempts made.
+  assert.equal(onDisk.length, 1);
+  assert.equal(manifest.session.totalScreenshots, onDisk.length);
+  assert.equal(manifest.session.totalScreenshots, manifest.screenshotFiles.length);
+});
+
+test('save() summary.txt "Screenshots:" line matches manifest.session.totalScreenshots', async () => {
+  const dir = tmpOutputDir();
+  const collector = new CaptureCollector({ outputDir: dir, targetUrl: 'https://x.test' });
+  const okPage = fakePage(async ({ path: p }) => {
+    fs.writeFileSync(p, 'fake-png');
+  });
+  const failingPage = fakePage(async () => {
+    throw new Error('simulated failure');
+  });
+
+  await collector.screenshot(okPage);
+  await collector.screenshot(failingPage);
+
+  const manifest = collector.save();
+  const summary = fs.readFileSync(path.join(dir, 'summary.txt'), 'utf8');
+
+  assert.match(summary, new RegExp(`Screenshots: ${manifest.session.totalScreenshots}\\b`));
 });
 
 test('save() writes CURRENT_CAPTURE_FORMAT_VERSION into manifest.json, and it round-trips through JSON', () => {
