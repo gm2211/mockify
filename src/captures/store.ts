@@ -138,6 +138,12 @@ export function summarizeCapture(name: string, dir: string): CaptureSummary | nu
   // Screenshot count comes from the screenshots/ directory itself rather
   // than manifest.session.totalScreenshots: the manifest field can go stale
   // relative to what's actually on disk, while the directory listing can't.
+  // As of SP-lsc.6, CaptureCollector.save() (src/agent/capture.ts) itself
+  // derives totalScreenshots from the same on-disk enumeration, so new
+  // manifests can't disagree with reality — but this workaround stays:
+  // captures already on disk (written before that fix) and captures from
+  // other writers (e.g. src/recorders/browse-and-capture.mjs) still carry
+  // the old counter-based field, and this function has to summarize both.
   let screenshots = 0;
   const screenshotDir = path.join(dir, 'screenshots');
   try {
