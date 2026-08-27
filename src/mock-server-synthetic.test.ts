@@ -7,43 +7,22 @@
  * A fixture under test/fixtures produces a small deterministic template
  * set; synthetic/index.json is generated into a temp copy of that fixture
  * at test setup time (not checked in), matching how a real capture works.
+ *
+ * Server readiness (SP-ish): spawnMockServer() (src/test-helpers/
+ * spawn-mock-server.ts) waits for the server's own "listening" line rather
+ * than an earlier startup log line — see that module's doc comment for why
+ * the earlier approach was an outright race, not just a slow-CI flake.
  */
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { generateSynthetic } from './synthesize/generate.js';
+import { spawnMockServer, REPO_ROOT } from './test-helpers/spawn-mock-server.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dirname, '..');
-const CLI_PATH = path.join(REPO_ROOT, 'src', 'cli.ts');
 const FIXTURE_TRAFFIC = path.join(REPO_ROOT, 'test', 'fixtures', 'synthetic-captures', 'traffic.json');
-
-function waitForOutput(child: ReturnType<typeof spawn>, pattern: RegExp, timeoutMs = 10_000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let buf = '';
-    const timer = setTimeout(() => {
-      reject(new Error(`Timed out waiting for /${pattern.source}/ in server output. Got:\n${buf}`));
-    }, timeoutMs);
-    const onData = (data: Buffer) => {
-      buf += data.toString();
-      if (pattern.test(buf)) {
-        clearTimeout(timer);
-        child.stderr?.off('data', onData);
-        resolve(buf);
-      }
-    };
-    child.stderr?.on('data', onData);
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
 
 /** Copy the fixture into a fresh temp dir and generate synthetic/index.json
  * into it, so each test run starts from a clean, disposable capture dir. */
@@ -61,20 +40,8 @@ async function withServer(
   extraEnv: Record<string, string>,
   fn: (port: number) => Promise<void>
 ): Promise<void> {
-  const port = 34567 + Math.floor(Math.random() * 1000);
-  const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, 'serve'], {
-    cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      PORT: String(port),
-      MOCK_DATA_PATH: captureDir,
-      ...extraEnv,
-    },
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-
+  const { child, port } = await spawnMockServer({ MOCK_DATA_PATH: captureDir, ...extraEnv });
   try {
-    await waitForOutput(child, /Loaded \d+ traffic entries|Synthetic replay disabled/);
     await fn(port);
   } finally {
     child.kill();
@@ -84,7 +51,7 @@ async function withServer(
 test('mock-server: an exact recorded path returns the RECORDED body, not a synthesized one', async () => {
   const dir = prepareCaptureDir();
   await withServer(dir, {}, async (port) => {
-    const res = await fetch(`http://localhost:${port}/api/widgets/1`);
+    const res = await fetch(`http://127.0.0.1:${port}/api/widgets/1`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-mockify-synthetic'), null);
     const body = await res.json();
@@ -96,7 +63,7 @@ test('mock-server: an exact recorded path returns the RECORDED body, not a synth
 test('mock-server: an unrecorded-but-templated path returns 200 + X-Mockify-Synthetic: true', async () => {
   const dir = prepareCaptureDir();
   await withServer(dir, {}, async (port) => {
-    const res = await fetch(`http://localhost:${port}/api/widgets/9`);
+    const res = await fetch(`http://127.0.0.1:${port}/api/widgets/9`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-mockify-synthetic'), 'true');
     const body = await res.json();
@@ -107,7 +74,7 @@ test('mock-server: an unrecorded-but-templated path returns 200 + X-Mockify-Synt
 test('mock-server: a wholly unknown path still 404s even with synthetic replay enabled', async () => {
   const dir = prepareCaptureDir();
   await withServer(dir, {}, async (port) => {
-    const res = await fetch(`http://localhost:${port}/completely/unknown/path`);
+    const res = await fetch(`http://127.0.0.1:${port}/completely/unknown/path`);
     assert.equal(res.status, 404);
     assert.equal(res.headers.get('x-mockify-synthetic'), null);
   });
@@ -116,7 +83,7 @@ test('mock-server: a wholly unknown path still 404s even with synthetic replay e
 test('mock-server: MOCK_SYNTHETIC=0 disables synthetic replay, falling straight through to 404', async () => {
   const dir = prepareCaptureDir();
   await withServer(dir, { MOCK_SYNTHETIC: '0' }, async (port) => {
-    const res = await fetch(`http://localhost:${port}/api/widgets/9`);
+    const res = await fetch(`http://127.0.0.1:${port}/api/widgets/9`);
     assert.equal(res.status, 404);
     assert.equal(res.headers.get('x-mockify-synthetic'), null);
   });
@@ -125,7 +92,7 @@ test('mock-server: MOCK_SYNTHETIC=0 disables synthetic replay, falling straight 
 test('mock-server: /_synthetic reports loaded templates', async () => {
   const dir = prepareCaptureDir();
   await withServer(dir, {}, async (port) => {
-    const res = await fetch(`http://localhost:${port}/_synthetic`);
+    const res = await fetch(`http://127.0.0.1:${port}/_synthetic`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.enabled, true);
