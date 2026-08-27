@@ -64,6 +64,13 @@
  *     `<captureDir>/impl/report.json` alongside the implementation. Exits
  *     non-zero if the final implementation fails to load or is flagged
  *     likely_hardcoded.
+ *
+ *   mockify openapi <name|path> [--out <path>]
+ *     Emits an OpenAPI 3.1 document (src/openapi/) from a capture's
+ *     endpoint templates + inferred response shapes (src/synthesize/,
+ *     re-derived from traffic.json — no need to run `synthesize` first).
+ *     Written to `--out`, or `<captureDir>/openapi.yaml` by default; YAML
+ *     unless `--out` ends in `.json`.
  */
 
 import { spawn } from 'node:child_process';
@@ -81,6 +88,7 @@ import { splitPairs } from './infer/split.js';
 import { validateImplementation, type Grade, type ValidationResult } from './infer/harness.js';
 import { computeGap, scanForHardcoding } from './infer/hardcoding.js';
 import { inferImplementation, type InferProgressEvent } from './infer/generate.js';
+import { buildOpenApiDocument, formatFromPath, serializeOpenApiDocument } from './openapi/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -100,7 +108,7 @@ function hasFlag(args: string[], flag: string): boolean {
 const VALUE_FLAGS = new Set([
   '--port', '--data', '--output', '--name', '--url',
   '--storage-state', '--save-storage-state', '--timeout',
-  '--impl', '--rounds', '--holdout', '--mode',
+  '--impl', '--rounds', '--holdout', '--mode', '--out',
 ]);
 
 /** First argument that isn't a flag or a flag's value. */
@@ -127,6 +135,7 @@ function printUsage(): void {
   console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
   console.error('  validate <name|path> [--impl <path>] [--json]       Grade a generated implementation against a capture (train/holdout + hardcoding check)');
   console.error('  infer <name|path> [--rounds N] [--holdout R] [--json]  Generate a real mock implementation from a capture');
+  console.error('  openapi <name|path> [--out <path>]                     Emit an OpenAPI 3.1 document from a capture (YAML by default, JSON if --out ends in .json)');
   console.error('  mcp                                                 Start a stdio MCP server exposing capture tools to any MCP-capable agent');
   console.error('');
   console.error('replay options:');
@@ -507,6 +516,50 @@ async function runSynthesize(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// openapi — emit an OpenAPI 3.1 document from a capture
+// ---------------------------------------------------------------------------
+
+async function runSpec(args: string[]): Promise<void> {
+  const usage = 'Usage: mockify openapi <name|path> [--out <path>]';
+  const nameOrPath = firstPositional(args);
+  if (!nameOrPath) {
+    console.error(usage);
+    process.exit(1);
+    return;
+  }
+
+  let resolved: { name: string; dir: string };
+  try {
+    resolved = resolveCapture(nameOrPath);
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  const trafficPath = path.join(resolved.dir, 'traffic.json');
+  if (!fs.existsSync(trafficPath)) {
+    console.error(`error: no traffic.json found in ${resolved.dir}`);
+    process.exit(1);
+    return;
+  }
+
+  const entries = JSON.parse(fs.readFileSync(trafficPath, 'utf8')) as CapturedTraffic[];
+  const doc = buildOpenApiDocument(entries, { title: resolved.name });
+
+  const outArg = parseFlag(args, '--out');
+  const outPath = outArg ? path.resolve(process.cwd(), outArg) : path.join(resolved.dir, 'openapi.yaml');
+  const format = formatFromPath(outPath);
+  const content = serializeOpenApiDocument(doc, format);
+
+  fs.writeFileSync(outPath, content, 'utf8');
+
+  const pathCount = Object.keys(doc.paths).length;
+  const operationCount = Object.values(doc.paths).reduce((n, item) => n + Object.keys(item).length, 0);
+  console.error(`Wrote OpenAPI 3.1 document (${pathCount} path(s), ${operationCount} operation(s)) → ${outPath}`);
+}
+
+// ---------------------------------------------------------------------------
 // validate — grade a generated implementation against a capture
 // ---------------------------------------------------------------------------
 
@@ -854,6 +907,9 @@ async function main(): Promise<void> {
       return;
     case 'infer':
       await runInfer(rest);
+      return;
+    case 'openapi':
+      await runSpec(rest);
       return;
     case 'mcp':
       await runMcp();
