@@ -72,6 +72,49 @@ X-Mockify-Synthetic: true
 
 `mockify capture` runs synthesis automatically (failures are non-fatal); regenerate by hand with `npx mockify synthesize --data captures/<name>`. `MOCK_SYNTHETIC=0` disables synthesis; `GET /_synthetic` and `GET /_impl` report what's loaded and hit counts for each tier.
 
+## OpenAPI export
+
+`mockify openapi <name|path> [--out <path>]` turns a capture straight into an OpenAPI 3.1 document — the same endpoint templates and inferred response shapes that power synthetic replay (`src/synthesize/`), serialized as an API spec instead of loaded into the mock server. It doesn't require `mockify synthesize` to have run first; it re-derives templates from `traffic.json` itself.
+
+```bash
+npx mockify openapi demo-grok                        # writes captures/demo-grok/openapi.yaml
+npx mockify openapi demo-grok --out api.json          # JSON instead of YAML — picked from --out's extension
+```
+
+Each endpoint template becomes a path item: repeated numeric/UUID path segments (`/api/room/1`, `/api/room/2`, ...) become a `{roomId}`-style path parameter, query string keys observed across the group's requests become query parameters (required only when every request carried them), and a captured `POST`/`PUT`/`PATCH` body becomes a `requestBody` schema (`application/json` or `application/x-www-form-urlencoded`, detected from the request's `Content-Type` header when captured, or sniffed from the body otherwise). Every distinct status code observed for a template — not just the modal one synthesis picks — gets its own response entry with a JSON Schema built from the same shape inference synthesis uses; response headers are included per-status when format v2 header capture (`requestHeaders`/`responseHeaders`) is present, but are never required. Output is YAML by default (mockify has no YAML dependency — `src/openapi/yaml.ts` hand-rolls a small block-style serializer for exactly this); pass `--out something.json` to get JSON instead.
+
+```yaml
+openapi: 3.1.0
+info:
+  title: demo-grok
+  version: 0.0.0
+paths:
+  /api/room/{roomId}:
+    get:
+      operationId: get_api_room_roomId
+      parameters:
+        - name: roomId
+          in: path
+          required: true
+          schema:
+            type: integer
+            examples:
+              - 1
+              - 2
+              - 3
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roomid: { type: number, examples: [1, 2, 3] }
+                  roomName: { type: string, examples: ["101", "102", "103"] }
+                required: [roomid, roomName]
+```
+
 ## Watching an inferred implementation work
 
 `mockify validate` grades a generated implementation on traffic it never saw during inference — a held-out split, not the training pairs — then the GIF proves the state is real: a message count read before a `POST`, the same `POST` answered by the implementation tier, and the count read again afterward, up by one.
