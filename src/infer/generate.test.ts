@@ -12,7 +12,9 @@ import {
   trainScore,
   inferImplementation,
   extractCodeFromResponse,
+  suggestedMinBudgetUsd,
   type InferAttempt,
+  type InferProgressEvent,
 } from './generate.js';
 import { splitPairs } from './split.js';
 import { validateImplementation } from './harness.js';
@@ -407,5 +409,64 @@ test('inferImplementation: writes report.json with a per-template breakdown for 
     assert.ok(summary.train.perTemplate.length > 0);
     assert.ok(summary.holdout.perTemplate.length > 0);
     assert.ok(summary.hardcoding.ratio < 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Budget default + pre-run warning (SP-qd4.1)
+// ---------------------------------------------------------------------------
+
+test('suggestedMinBudgetUsd: scales roughly linearly from the SP-qd4.1 reference point (61k chars -> $25)', () => {
+  assert.equal(suggestedMinBudgetUsd(61_000), 25);
+  assert.equal(suggestedMinBudgetUsd(30_500), 12.5);
+  assert.equal(suggestedMinBudgetUsd(122_000), 50);
+});
+
+test('suggestedMinBudgetUsd: floors at $5 for a tiny prompt', () => {
+  assert.equal(suggestedMinBudgetUsd(100), 5);
+  assert.equal(suggestedMinBudgetUsd(0), 5);
+});
+
+test('inferImplementation: emits budget_warning when the configured budget is inadequate for the prompt size', async () => {
+  await withTempCapture(async (tmpDir) => {
+    fs.copyFileSync(FIXTURE_TRAFFIC, path.join(tmpDir, 'traffic.json'));
+    const good = fs.readFileSync(GOOD_IMPL, 'utf8');
+    const generateFn = async (): Promise<string> => good;
+
+    const events: InferProgressEvent[] = [];
+    await inferImplementation({
+      captureDir: tmpDir,
+      rounds: 1,
+      generateFn,
+      budgetUsd: 0.01, // absurdly small — must trigger the warning regardless of this fixture's actual prompt size
+      onProgress: (e) => events.push(e),
+    });
+
+    const warning = events.find((e) => e.type === 'budget_warning');
+    assert.ok(warning, 'expected a budget_warning progress event');
+    if (warning && warning.type === 'budget_warning') {
+      assert.equal(warning.budgetUsd, 0.01);
+      assert.ok(warning.suggestedMinUsd >= 5); // floor from suggestedMinBudgetUsd
+      assert.equal(warning.envVar, 'MOCKIFY_INFER_MAX_BUDGET_USD');
+    }
+  });
+});
+
+test('inferImplementation: does NOT emit budget_warning when the configured budget comfortably covers the prompt', async () => {
+  await withTempCapture(async (tmpDir) => {
+    fs.copyFileSync(FIXTURE_TRAFFIC, path.join(tmpDir, 'traffic.json'));
+    const good = fs.readFileSync(GOOD_IMPL, 'utf8');
+    const generateFn = async (): Promise<string> => good;
+
+    const events: InferProgressEvent[] = [];
+    await inferImplementation({
+      captureDir: tmpDir,
+      rounds: 1,
+      generateFn,
+      budgetUsd: 1000, // this fixture's prompt is tiny relative to the 61k-char reference point
+      onProgress: (e) => events.push(e),
+    });
+
+    assert.equal(events.some((e) => e.type === 'budget_warning'), false);
   });
 });

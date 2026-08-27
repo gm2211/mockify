@@ -50,6 +50,7 @@ import { splitPairs } from './split.js';
 import { loadImplementation, ImplementationLoadError } from './contract.js';
 import { validateImplementation, type Grade, type ValidationResult } from './harness.js';
 import { computeGap, scanForHardcoding, type GapResult, type ScanResult } from './hardcoding.js';
+import { classifyResultMessage, reclassifyAbortError } from '../agent/sdk-errors.js';
 
 // ---------------------------------------------------------------------------
 // The contract, verbatim
@@ -92,6 +93,10 @@ export interface InferOptions {
   /** Wall-clock timeout per generation call, ms. Falls back to
    * MOCKIFY_INFER_TIMEOUT_MS, then 480_000 (8 minutes). */
   timeoutMs?: number;
+  /** Per-round budget ceiling in USD, passed to the SDK as `maxBudgetUsd`.
+   * Falls back to MOCKIFY_INFER_MAX_BUDGET_USD, then DEFAULT_BUDGET_USD —
+   * see that constant's doc for where the default comes from. */
+  budgetUsd?: number;
   /**
    * Testing-only escape hatch: replaces the real Agent SDK call. Given the
    * full prompt text for this round, must resolve to the model's raw
@@ -111,6 +116,13 @@ export type InferProgressEvent =
       promptChars: number;
       examplesPerTemplate: number;
       bodyCharCap: number;
+    }
+  | {
+      type: 'budget_warning';
+      budgetUsd: number;
+      suggestedMinUsd: number;
+      promptChars: number;
+      envVar: string;
     }
   | { type: 'round_start'; round: number; rounds: number }
   | { type: 'round_generated'; round: number; sourceChars: number }
@@ -572,6 +584,41 @@ function resolveModel(override?: string): string {
   return override || process.env.MOCKIFY_INFER_MODEL || DEFAULT_MODEL;
 }
 
+const BUDGET_ENV_VAR = 'MOCKIFY_INFER_MAX_BUDGET_USD';
+
+/** Default per-round budget ceiling, USD. Was 3 — far below what one round
+ * against the default model (claude-opus-4-6) actually costs: the SP-qd4.1
+ * bug report reproduced a mid-generation budget cutoff twice at $3 on a
+ * realistic 152-entry/61k-char-prompt capture, then succeeded immediately
+ * at $25. 25 is that measured figure, not a guess with headroom built in —
+ * a capture materially larger than the one that produced it can still
+ * exceed it, which is exactly what suggestedMinBudgetUsd below exists to
+ * warn about ahead of a run. */
+const DEFAULT_BUDGET_USD = 25;
+
+function resolveBudgetUsd(override?: number): number {
+  if (override !== undefined && override > 0) return override;
+  return envNumber(BUDGET_ENV_VAR, DEFAULT_BUDGET_USD);
+}
+
+/** Reference point the scaling below is anchored to: the SP-qd4.1 report's
+ * 61,000-char prompt needed ~$25 for one round against the default model
+ * (maxTurns 4, each turn re-sending the full prompt). This is a rough
+ * linear scale from a single data point, not a real cost model — prompt
+ * size, model, and per-round token growth all vary by capture — so it's
+ * used only to flag a budget that looks obviously too small before a run,
+ * not to compute a precise estimate. */
+const REFERENCE_PROMPT_CHARS = 61_000;
+const REFERENCE_BUDGET_USD = 25;
+const MIN_SUGGESTED_BUDGET_USD = 5;
+
+/** Suggested minimum budget for a prompt of this size, scaled from the
+ * SP-qd4.1 reference point above, floored at MIN_SUGGESTED_BUDGET_USD. */
+export function suggestedMinBudgetUsd(promptChars: number): number {
+  const scaled = (promptChars / REFERENCE_PROMPT_CHARS) * REFERENCE_BUDGET_USD;
+  return Math.max(MIN_SUGGESTED_BUDGET_USD, scaled);
+}
+
 const GENERATION_SYSTEM_PROMPT =
   'You generate a single Node.js ESM mock-server implementation module from observed HTTP traffic. ' +
   'Respond with ONLY the complete file content inside one ```javascript code block — no prose before or after.';
@@ -589,10 +636,19 @@ export function extractCodeFromResponse(raw: string): string {
  * for InferOptions.generateFn. Guarded by a wall-clock timeout wired into
  * the SDK's own AbortController so an in-flight call is actually cancelled,
  * not just abandoned. No tools are exposed: this is a pure text-generation
- * call, not an agentic session. */
-async function callAgentSdk(prompt: string, model: string, timeoutMs: number): Promise<string> {
+ * call, not an agentic session.
+ *
+ * Error classification: a budget cutoff can surface two ways — a clean
+ * `result` message with subtype `error_max_budget_usd` (classifyResultMessage
+ * handles this), or the SDK hard-killing its subprocess mid-stream, which
+ * throws the SDK's own generic "Claude Code process aborted by user" instead
+ * of a result message at all (reclassifyAbortError handles this). See
+ * src/agent/sdk-errors.ts for why both are needed and how the ambiguous
+ * abort case is distinguished from a real caller-requested abort. */
+async function callAgentSdk(prompt: string, model: string, timeoutMs: number, budgetUsd: number): Promise<string> {
   const abortController = new AbortController();
-  const timer = setTimeout(() => abortController.abort(new Error(`Generation timed out after ${timeoutMs}ms`)), timeoutMs);
+  const timeoutError = new Error(`Generation timed out after ${timeoutMs}ms`);
+  const timer = setTimeout(() => abortController.abort(timeoutError), timeoutMs);
 
   try {
     const options: Options = {
@@ -603,21 +659,25 @@ async function callAgentSdk(prompt: string, model: string, timeoutMs: number): P
       allowDangerouslySkipPermissions: true,
       cwd: process.cwd(),
       maxTurns: 4,
-      maxBudgetUsd: envNumber('MOCKIFY_INFER_MAX_BUDGET_USD', 3),
+      maxBudgetUsd: budgetUsd,
       persistSession: false,
       abortController,
     };
 
-    const q = query({ prompt, options });
     let finalResult = '';
-    for await (const message of q) {
-      if (message.type === 'result') {
-        if (message.subtype === 'success') {
-          finalResult = message.result;
-        } else {
-          throw new Error(`Agent ended with ${message.subtype}`);
+    try {
+      const q = query({ prompt, options });
+      for await (const message of q) {
+        if (message.type === 'result') {
+          if (message.subtype === 'success') {
+            finalResult = message.result;
+          } else {
+            throw classifyResultMessage(message, budgetUsd, BUDGET_ENV_VAR);
+          }
         }
       }
+    } catch (err) {
+      throw reclassifyAbortError(err, { signal: abortController.signal, ownAbortReason: timeoutError, budgetUsd, envVar: BUDGET_ENV_VAR });
     }
     if (!finalResult.trim()) throw new Error('Agent returned an empty response');
     return finalResult;
@@ -721,7 +781,9 @@ export async function inferImplementation(opts: InferOptions): Promise<InferSumm
   const onProgress = opts.onProgress ?? ((): void => {});
   const model = resolveModel(opts.model);
   const timeoutMs = opts.timeoutMs ?? envNumber('MOCKIFY_INFER_TIMEOUT_MS', DEFAULT_TIMEOUT_MS);
-  const generate = opts.generateFn ?? ((prompt: string): Promise<string> => callAgentSdk(prompt, model, timeoutMs));
+  const budgetUsd = resolveBudgetUsd(opts.budgetUsd);
+  const generate =
+    opts.generateFn ?? ((prompt: string): Promise<string> => callAgentSdk(prompt, model, timeoutMs, budgetUsd));
 
   const captureDir = path.resolve(opts.captureDir);
   const trafficPath = path.join(captureDir, 'traffic.json');
@@ -768,6 +830,17 @@ export async function inferImplementation(opts: InferOptions): Promise<InferSumm
     examplesPerTemplate: built.examplesPerTemplateUsed,
     bodyCharCap: built.bodyCharCapUsed,
   });
+
+  const suggestedMinUsd = suggestedMinBudgetUsd(built.promptChars);
+  if (budgetUsd < suggestedMinUsd) {
+    onProgress({
+      type: 'budget_warning',
+      budgetUsd,
+      suggestedMinUsd,
+      promptChars: built.promptChars,
+      envVar: BUDGET_ENV_VAR,
+    });
+  }
 
   const implDir = path.join(captureDir, 'impl');
   fs.mkdirSync(implDir, { recursive: true });

@@ -20,6 +20,7 @@ import { createBrowserMcpServer } from './browser-mcp.js';
 import { resolveStorageStateInput, saveStorageStateOutput } from './storage-state.js';
 import { getCapturePrompt } from './prompts.js';
 import { generateSynthetic } from '../synthesize/generate.js';
+import { budgetExceededMessage, reclassifyAbortError } from './sdk-errors.js';
 
 /**
  * Numeric override from the environment for per-run agent caps
@@ -235,7 +236,12 @@ interface QueryResult {
   costUsd: number;
 }
 
-async function executeQuery(queryOptions: Options, prompt: string, debug: boolean | undefined): Promise<QueryResult> {
+async function executeQuery(
+  queryOptions: Options,
+  prompt: string,
+  debug: boolean | undefined,
+  ownAbortReason?: Error,
+): Promise<QueryResult> {
   let finalResult = '';
   let costUsd = 0;
   let receivedFirstMessage = false;
@@ -320,15 +326,33 @@ async function executeQuery(queryOptions: Options, prompt: string, debug: boolea
           costUsd = message.total_cost_usd;
         } else {
           costUsd = message.total_cost_usd;
-          throw wrapWithStderr(new AgentError(message.subtype, costUsd), stderrBuf);
+          const agentErr = new AgentError(message.subtype, costUsd);
+          // SP-qd4.1: a clean error_max_budget_usd result still reads as an
+          // opaque "Agent ended with error_max_budget_usd" by default — spell
+          // out the actual cause and the remediation, same wording as the
+          // abrupt-abort case below (see sdk-errors.ts).
+          if (message.subtype === 'error_max_budget_usd') {
+            agentErr.message = budgetExceededMessage(queryOptions.maxBudgetUsd ?? 0, 'MOCKIFY_MAX_BUDGET_USD', costUsd);
+          }
+          throw wrapWithStderr(agentErr, stderrBuf);
         }
       }
     }
   } catch (err) {
+    // SP-qd4.1: the SDK can also hard-kill its subprocess mid-generation on
+    // budget exhaustion without ever emitting the 'result' message handled
+    // above, surfacing only its own generic "Claude Code process aborted by
+    // user" — indistinguishable, on its face, from a real caller-requested
+    // abort. reclassifyAbortError tells the two apart (see sdk-errors.ts)
+    // using the AbortController this call owns exclusively.
+    const signal = queryOptions.abortController?.signal;
+    const reclassified = signal
+      ? reclassifyAbortError(err, { signal, ownAbortReason, budgetUsd: queryOptions.maxBudgetUsd ?? 0, envVar: 'MOCKIFY_MAX_BUDGET_USD' })
+      : err;
     // Wrap any error that bubbles out of the query iteration with the captured
     // stderr tail. This covers the most common case: the SDK throws
     // 'Claude Code process exited with code 1' and discards subprocess stderr.
-    throw wrapWithStderr(err, stderrBuf);
+    throw wrapWithStderr(reclassified, stderrBuf);
   } finally {
     if (initTimer) clearTimeout(initTimer);
   }
@@ -384,10 +408,15 @@ export async function runCaptureAgent(opts: CaptureAgentOptions): Promise<Captur
   // attempt): wired into the SDK's own abortController so an in-flight query
   // is actually cancelled, not just skipped on the next retry iteration.
   const abortController = new AbortController();
+  // Kept as its own reference (not inlined into the setTimeout callback) so
+  // executeQuery can compare it by identity against AbortSignal.reason and
+  // tell "we aborted this ourselves" apart from an SDK-internal hard-kill —
+  // see reclassifyAbortError in sdk-errors.ts (SP-qd4.1).
+  const timeoutError = opts.timeoutMs ? new Error(`Capture timed out after ${opts.timeoutMs}ms`) : undefined;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-  if (opts.timeoutMs) {
+  if (opts.timeoutMs && timeoutError) {
     timeoutTimer = setTimeout(() => {
-      abortController.abort(new Error(`Capture timed out after ${opts.timeoutMs}ms`));
+      abortController.abort(timeoutError);
     }, opts.timeoutMs);
   }
 
@@ -427,7 +456,17 @@ export async function runCaptureAgent(opts: CaptureAgentOptions): Promise<Captur
       allowDangerouslySkipPermissions: true,
       cwd: process.cwd(),
       maxTurns: envNumber('MOCKIFY_MAX_TURNS', 200),
-      maxBudgetUsd: envNumber('MOCKIFY_MAX_BUDGET_USD', 5),
+      // SP-qd4.1: $5 was sized for a small site; a capture session can run
+      // up to 200 turns of tool calls against the default model (Opus) and
+      // easily exceed it on a larger one. No measured reference point for
+      // capture spend the way src/infer/generate.ts has one for generation
+      // (see DEFAULT_BUDGET_USD there) — this is a conservative bump, not a
+      // data-derived figure — but the budget-exhaustion path now reports
+      // itself correctly (see AgentError.message above / sdk-errors.ts)
+      // instead of the misleading "aborted by user", so raising it trades a
+      // small amount of extra spend risk for far fewer false-alarm capture
+      // failures on larger sites.
+      maxBudgetUsd: envNumber('MOCKIFY_MAX_BUDGET_USD', 15),
       persistSession: false,
       abortController,
     };
@@ -447,7 +486,7 @@ export async function runCaptureAgent(opts: CaptureAgentOptions): Promise<Captur
           await sleep(delayMs);
         }
 
-        const result = await executeQuery(queryOptions, userPrompt, opts.debug);
+        const result = await executeQuery(queryOptions, userPrompt, opts.debug, timeoutError);
         return { result: result.result, costUsd: result.costUsd + totalCostUsd };
       } catch (err) {
         lastError = err;
@@ -473,7 +512,14 @@ export async function runCaptureAgent(opts: CaptureAgentOptions): Promise<Captur
             throw enhanced;
           }
           if (err instanceof AgentError) {
-            throw new AgentError(err.subtype, totalCostUsd, err);
+            // Preserve the original message (e.g. the SP-qd4.1 budget-
+            // exhaustion wording set above) — the AgentError constructor
+            // alone only ever produces the generic "Agent ended with
+            // <subtype>" text, which would silently overwrite it here.
+            const enhanced = new AgentError(err.subtype, totalCostUsd, err);
+            enhanced.message = msg;
+            enhanced.stack = err.stack;
+            throw enhanced;
           }
           throw err;
         }
