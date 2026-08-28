@@ -35,6 +35,17 @@
  *     capture directory / traffic.json. No env vars required; port defaults
  *     to 3456.
  *
+ *   mockify replay <name|path> --against <url> [--json] [--timeout <ms>]
+ *                               [--header "Name: value"]
+ *     Deterministic port of specify's agent-driven `specify replay
+ *     --capture --url` (SP-7ow.2): fires every request recorded in the
+ *     capture at a live `--against` target (src/diff/fire.ts) and diffs
+ *     each response against what was recorded (src/diff/engine.ts) —
+ *     status, structure, and values, with redacted ([REDACTED]) fields
+ *     excluded and a heuristic tolerance for volatile fields (ids,
+ *     timestamps, tokens). No agent involved. Exits 0 if every request
+ *     matched, 1 on any mismatch or request failure.
+ *
  *   mockify serve [--port N] [--data <path>]
  *     Back-compat alias for `replay`: starts the mock server against
  *     `--data` (or MOCK_DATA_PATH, or the newest capture found under
@@ -90,6 +101,8 @@ import { validateImplementation, type Grade, type ValidationResult } from './inf
 import { computeGap, scanForHardcoding } from './infer/hardcoding.js';
 import { inferImplementation, type InferProgressEvent } from './infer/generate.js';
 import { buildOpenApiDocument, formatFromPath, serializeOpenApiDocument } from './openapi/index.js';
+import { readCaptureTraffic, replayAgainst, type ReplayAgainstSummary } from './replay/against.js';
+import type { DiffResult } from './diff/engine.js';
 
 function parseFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -108,6 +121,7 @@ const VALUE_FLAGS = new Set([
   '--port', '--data', '--output', '--name', '--url',
   '--storage-state', '--save-storage-state', '--timeout',
   '--impl', '--rounds', '--holdout', '--mode', '--out', '--speed',
+  '--against', '--header',
 ]);
 
 /** First argument that isn't a flag or a flag's value. */
@@ -130,6 +144,7 @@ function printUsage(): void {
   console.error('  capture --url <url> [options]                       Record traffic from a live site (agent-driven by default)');
   console.error('  list [--json]                                       List saved captures');
   console.error('  replay <name|path> [--port N] [--mode M] [--impl <path>] [--latency|--speed N]  Replay a saved capture');
+  console.error('  replay <name|path> --against <url> [--json] [--timeout ms] [--header "N: v"]  Fire captured requests at a live target and diff responses');
   console.error('  serve [--port N] [--data <path>] [--latency|--speed N]  Back-compat alias for replay');
   console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
   console.error('  validate <name|path> [--impl <path>] [--json]       Grade a generated implementation against a capture (train/holdout + hardcoding check)');
@@ -148,6 +163,15 @@ function printUsage(): void {
   console.error('  --speed <factor>                Replay latency scaled by factor — implies --latency; 2 = twice as fast');
   console.error('                                  (half the delay), 0.5 = half as fast (double the delay); default: 1 (real-time)');
   console.error('  --no-latency                    Disable latency replay outright (equivalent to infinite speed — the default)');
+  console.error('');
+  console.error('replay --against options (deterministic: fire captured traffic at a live target, diff vs. recorded):');
+  console.error('  --against <url>                 Required — live target to fire the capture\'s requests at');
+  console.error('  --json                          Emit machine-readable JSON (per-request diff + summary counts) instead of a text report');
+  console.error('  --timeout <ms>                  Abort a single request after this many milliseconds (default: 15000)');
+  console.error('  --header "Name: value"           Extra request header, repeatable — wins over any recorded header of the same name');
+  console.error('                                  (use this to supply real auth for a header that was redacted at capture time)');
+  console.error('  Exit code: 0 if every request matched, 1 on any mismatch or request failure.');
+  console.error('  Note: a captured field whose recorded value is "[REDACTED]" can never match a live value and is excluded from diffing.');
   console.error('');
   console.error('capture options:');
   console.error('  --name <name>                  Name to save the capture under (default: slugified from the URL)');
@@ -261,14 +285,144 @@ function formatPct(rate: number | null | undefined): string {
   return rate === null || rate === undefined ? 'n/a' : `${(rate * 100).toFixed(0)}%`;
 }
 
+/** Parse zero or more repeated `--header "Name: value"` flags into a
+ * lower-cased header map. Used by `replay --against` and `compare` to let
+ * a caller supply real auth for a target whose recorded header was
+ * redacted (src/diff/fire.ts drops a "[REDACTED]" header rather than
+ * forward it literally). */
+function parseHeaderFlags(args: string[], usage: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== '--header') continue;
+    const raw = args[i + 1];
+    const sep = raw ? raw.indexOf(':') : -1;
+    if (!raw || sep <= 0) {
+      console.error(`error: --header must look like "Name: value", got ${JSON.stringify(raw ?? '')}`);
+      console.error(usage);
+      process.exit(1);
+    }
+    out[raw.slice(0, sep).trim().toLowerCase()] = raw.slice(sep + 1).trim();
+  }
+  return out;
+}
+
+/** Print a compact human-readable failure line for one entry of a
+ * replay-against/compare run — shared so both commands' non-JSON output
+ * looks the same. `expectedLabel`/`actualLabel` name the two sides being
+ * compared (e.g. "recorded"/"live", or "remote"/"local"). */
+function printDiffFailure(
+  method: string,
+  url: string,
+  diff: DiffResult,
+  error: string | undefined,
+  expectedLabel: string,
+  actualLabel: string,
+): void {
+  console.log(`  ✗ ${method} ${url}`);
+  if (error) {
+    console.log(`      error: ${error}`);
+    return;
+  }
+  if (!diff.statusMatch) {
+    console.log(`      status: ${expectedLabel} ${diff.expectedStatus}, ${actualLabel} ${diff.actualStatus}`);
+  }
+  const shown = diff.mismatches.slice(0, 5);
+  for (const m of shown) {
+    console.log(
+      `      ${m.path}: ${m.reason} (${expectedLabel} ${JSON.stringify(m.expected)}, ${actualLabel} ${JSON.stringify(m.actual)})`
+    );
+  }
+  if (diff.mismatches.length > shown.length) {
+    console.log(`      ... and ${diff.mismatches.length - shown.length} more`);
+  }
+}
+
+/** `mockify replay <name> --against <url>` — deterministic port of
+ * specify's agent-driven `specify replay --capture --url` (SP-7ow.2): fire
+ * every captured request at a live target and diff each response against
+ * what was recorded (src/replay/against.ts). Exit 0 if everything matched,
+ * 1 otherwise (mismatch or a request that failed to fire). */
+async function runReplayAgainst(nameOrPath: string, args: string[]): Promise<void> {
+  const usage =
+    'Usage: mockify replay <name|path> --against <url> [--json] [--timeout <ms>] [--header "Name: value"]';
+
+  let resolved: { name: string; dir: string };
+  try {
+    resolved = resolveCapture(nameOrPath);
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  const targetUrl = parseFlag(args, '--against')!;
+  try {
+    new URL(targetUrl);
+  } catch {
+    console.error(`error: --against must be a valid URL, got ${JSON.stringify(targetUrl)}`);
+    console.error(usage);
+    process.exit(1);
+    return;
+  }
+
+  const timeoutArg = parseFlag(args, '--timeout');
+  let timeoutMs: number | undefined;
+  if (timeoutArg !== undefined) {
+    timeoutMs = Number(timeoutArg);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      console.error(`error: --timeout must be a positive number of milliseconds, got ${JSON.stringify(timeoutArg)}`);
+      console.error(usage);
+      process.exit(1);
+      return;
+    }
+  }
+
+  const extraHeaders = parseHeaderFlags(args, usage);
+  const jsonOut = hasFlag(args, '--json');
+
+  let entries;
+  try {
+    entries = readCaptureTraffic(resolved.dir);
+  } catch (err) {
+    console.error(`error: could not read traffic.json for "${resolved.name}": ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  const summary: ReplayAgainstSummary = await replayAgainst(entries, targetUrl, { timeoutMs, extraHeaders });
+
+  if (jsonOut) {
+    console.log(JSON.stringify(summary, null, 2));
+  } else {
+    console.log(`Replayed "${resolved.name}" (${summary.total} request(s)) against ${targetUrl}`);
+    console.log(`  matched:    ${summary.matched}`);
+    console.log(`  mismatched: ${summary.mismatched}`);
+    console.log(`  errored:    ${summary.errored}`);
+    if (summary.mismatched > 0 || summary.errored > 0) {
+      console.log('');
+      for (const r of summary.results) {
+        if (!r.error && r.diff.match) continue;
+        printDiffFailure(r.method, r.url, r.diff, r.error, 'recorded', 'live');
+      }
+    }
+  }
+
+  process.exit(summary.mismatched === 0 && summary.errored === 0 ? 0 : 1);
+}
+
 async function runReplay(args: string[]): Promise<void> {
   const usage =
     'Usage: mockify replay <name|path> [--port N] [--mode auto|record|impl|synthetic] [--impl <path>] ' +
-    '[--latency|--speed N|--no-latency]';
+    '[--latency|--speed N|--no-latency] [--against <url> [--json] [--timeout <ms>] [--header "Name: value"]]';
   const nameOrPath = firstPositional(args);
   if (!nameOrPath) {
     console.error(usage);
     process.exit(1);
+    return;
+  }
+
+  if (hasFlag(args, '--against')) {
+    await runReplayAgainst(nameOrPath, args);
     return;
   }
 

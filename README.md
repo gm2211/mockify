@@ -137,6 +137,22 @@ No env vars, no config file — `--port` overrides the default if you need it. T
 
 ![mockify list showing a saved capture, a look at its files and inferred templates, then a clean replay banner and a recorded-vs-synthesized curl comparison](assets/demo.gif)
 
+## Replay against a live target
+
+`mockify replay <name> --against <url>` fires every request in a capture at a real, live target instead of serving them from a mock server, and diffs each response against what was originally recorded — status, structure, and values (`src/diff/engine.ts`). This is the deterministic port of specify's agent-driven `specify replay --capture --url`: no LLM, no cost, same comparator every run.
+
+```bash
+mockify replay demo-grok --against https://staging.example.com          # text report
+mockify replay demo-grok --against https://staging.example.com --json   # machine-readable summary + per-request diffs
+mockify replay demo-grok --against http://localhost:8080 --header "Authorization: Bearer <token>"
+```
+
+Exit code is `0` if every request matched, `1` on any mismatch or request that failed to fire. `--timeout <ms>` bounds how long a single request is allowed to hang (default 15000). `--header "Name: value"` is repeatable and always wins over a recorded header of the same name — use it to supply real auth when the recorded header was redacted (see below).
+
+Two kinds of fields are never treated as a mismatch, and are listed separately (`ignoredFields`) rather than silently dropped:
+- A recorded field whose value is the redaction placeholder `"[REDACTED]"` — a redacted capture can never match a live value by construction, so it's excluded from diffing entirely.
+- A field that looks volatile by name (`id`, `createdAt`, `sessionToken`, `csrf`, ...) or by value shape (UUID, ISO timestamp, plausible unix-epoch integer) — the same tolerance specify's own replay prompt applies ("ignore timestamps, session IDs, CSRF tokens").
+
 ## Quickstart
 
 ```bash
