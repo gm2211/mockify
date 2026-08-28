@@ -80,7 +80,7 @@ import * as path from 'node:path';
 import { runCaptureAgent } from './agent/runner.js';
 import { resolveStorageStateInput } from './agent/storage-state.js';
 import { generateSynthetic } from './synthesize/generate.js';
-import { startMockServer, type ReplayMode } from './mock-server.js';
+import { startMockServer, type ReplayMode, type LatencyOptions } from './mock-server.js';
 import { allocateCaptureDir, listCaptures, resolveCapture, summarizeCapture, type CaptureSummary } from './captures/store.js';
 import type { CapturedTraffic } from './format/types.js';
 import { loadImplementation, ImplementationLoadError } from './infer/contract.js';
@@ -108,7 +108,7 @@ function hasFlag(args: string[], flag: string): boolean {
 const VALUE_FLAGS = new Set([
   '--port', '--data', '--output', '--name', '--url',
   '--storage-state', '--save-storage-state', '--timeout',
-  '--impl', '--rounds', '--holdout', '--mode', '--out',
+  '--impl', '--rounds', '--holdout', '--mode', '--out', '--speed',
 ]);
 
 /** First argument that isn't a flag or a flag's value. */
@@ -130,8 +130,8 @@ function printUsage(): void {
   console.error('Commands:');
   console.error('  capture --url <url> [options]                       Record traffic from a live site (agent-driven by default)');
   console.error('  list [--json]                                       List saved captures');
-  console.error('  replay <name|path> [--port N] [--mode M] [--impl <path>]  Replay a saved capture');
-  console.error('  serve [--port N] [--data <path>]                    Back-compat alias for replay');
+  console.error('  replay <name|path> [--port N] [--mode M] [--impl <path>] [--latency|--speed N]  Replay a saved capture');
+  console.error('  serve [--port N] [--data <path>] [--latency|--speed N]  Back-compat alias for replay');
   console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
   console.error('  validate <name|path> [--impl <path>] [--json]       Grade a generated implementation against a capture (train/holdout + hardcoding check)');
   console.error('  infer <name|path> [--rounds N] [--holdout R] [--json]  Generate a real mock implementation from a capture');
@@ -145,6 +145,10 @@ function printUsage(): void {
   console.error('                                  impl:      recorded → implementation, then 404 (no shape synthesis)');
   console.error('                                  synthetic: recorded → synthesis, then 404 (skip a misbehaving implementation)');
   console.error('  --impl <path>                  Override the implementation module (default: <capture>/impl/handlers.mjs)');
+  console.error('  --latency                      Replay captured per-endpoint delays in real time (default: instant responses)');
+  console.error('  --speed <factor>                Replay latency scaled by factor — implies --latency; 2 = twice as fast');
+  console.error('                                  (half the delay), 0.5 = half as fast (double the delay); default: 1 (real-time)');
+  console.error('  --no-latency                    Disable latency replay outright (equivalent to infinite speed — the default)');
   console.error('');
   console.error('capture options:');
   console.error('  --name <name>                  Name to save the capture under (default: slugified from the URL)');
@@ -172,15 +176,57 @@ function parsePort(raw: string | undefined, usage: string): number | undefined {
   return port;
 }
 
+function parseSpeed(raw: string | undefined, usage: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const speed = Number(raw);
+  if (!Number.isFinite(speed) || speed <= 0) {
+    console.error(`error: --speed must be a positive number, got "${raw}"`);
+    console.error(usage);
+    process.exit(1);
+  }
+  return speed;
+}
+
+/**
+ * Resolve --latency/--speed/--no-latency into a LatencyOptions
+ * (src/latency.ts). Latency replay is opt-in — the default (no flags at
+ * all) is `{ enabled: false }`, i.e. today's instant-response behavior,
+ * unchanged: enabling real-time replay by default would have silently
+ * slowed down every existing consumer (and the test suite) the moment they
+ * upgraded, for a feature most replay sessions don't need. Passing
+ * `--speed <n>` implies `--latency` (asking for a speed only makes sense if
+ * delays are on); `--latency` alone means real-time (speed 1). `--no-latency`
+ * always wins outright and conflicts with either — asking for a speed while
+ * also disabling latency is a contradiction, not a "last flag wins" case.
+ */
+function parseLatencyOptions(args: string[], usage: string): LatencyOptions {
+  const noLatency = hasFlag(args, '--no-latency');
+  const latencyFlag = hasFlag(args, '--latency');
+  const speed = parseSpeed(parseFlag(args, '--speed'), usage);
+
+  if (noLatency && (latencyFlag || speed !== undefined)) {
+    console.error('error: --no-latency cannot be combined with --latency or --speed');
+    console.error(usage);
+    process.exit(1);
+  }
+
+  if (noLatency) return { enabled: false, speed: 1 };
+  if (latencyFlag || speed !== undefined) return { enabled: true, speed: speed ?? 1 };
+  return { enabled: false, speed: 1 };
+}
+
 async function runServe(args: string[]): Promise<void> {
-  const port = parsePort(parseFlag(args, '--port'), 'Usage: mockify serve [--data <path>] [--port N]');
+  const usage = 'Usage: mockify serve [--data <path>] [--port N] [--latency|--speed N|--no-latency]';
+  const port = parsePort(parseFlag(args, '--port'), usage);
   const data = parseFlag(args, '--data');
+  const latency = parseLatencyOptions(args, usage);
 
   console.error('note: `mockify serve` is a back-compat alias — prefer `mockify replay <name>` (see `mockify list`).');
 
   await startMockServer({
     dataPath: data ? path.resolve(process.cwd(), data) : undefined,
     port,
+    latency,
   });
 }
 
@@ -217,7 +263,9 @@ function formatPct(rate: number | null | undefined): string {
 }
 
 async function runReplay(args: string[]): Promise<void> {
-  const usage = 'Usage: mockify replay <name|path> [--port N] [--mode auto|record|impl|synthetic] [--impl <path>]';
+  const usage =
+    'Usage: mockify replay <name|path> [--port N] [--mode auto|record|impl|synthetic] [--impl <path>] ' +
+    '[--latency|--speed N|--no-latency]';
   const nameOrPath = firstPositional(args);
   if (!nameOrPath) {
     console.error(usage);
@@ -238,8 +286,9 @@ async function runReplay(args: string[]): Promise<void> {
   const mode = parseMode(parseFlag(args, '--mode'), usage);
   const implArg = parseFlag(args, '--impl');
   const implPath = implArg ? path.resolve(process.cwd(), implArg) : undefined;
+  const latency = parseLatencyOptions(args, usage);
 
-  const started = await startMockServer({ dataPath: resolved.dir, port, quiet: true, mode, implPath });
+  const started = await startMockServer({ dataPath: resolved.dir, port, quiet: true, mode, implPath, latency });
 
   const summary = summarizeCapture(resolved.name, resolved.dir);
 
@@ -275,6 +324,12 @@ async function runReplay(args: string[]): Promise<void> {
     console.error(
       `  implementation: FAILED to load from ${started.implementation.implPath} — ${started.implementation.loadError}`
     );
+  }
+
+  if (started.latency.enabled) {
+    console.error(`  latency: replaying captured durations at ${started.latency.speed}x speed (cap 30s)`);
+  } else {
+    console.error('  latency: disabled (pass --latency or --speed <n> for real-time replay)');
   }
 
   console.error(`  → http://localhost:${started.port}`);

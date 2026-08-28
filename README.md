@@ -128,9 +128,12 @@ mockify list                            # table of saved captures: target, count
 mockify replay demo-grok                # serves it on http://localhost:3456, all tiers active
 mockify replay demo-grok --mode impl    # implementation → recorded, no shape synthesis
 mockify replay demo-grok --impl <path>  # try a candidate implementation without moving files
+mockify replay demo-grok --latency      # replay each response's real captured delay too
 ```
 
 No env vars, no config file — `--port` overrides the default if you need it. The banner states which tiers are active and, when an implementation is loaded, its train/holdout pass rate and hardcoding verdict from `impl/report.json` (a `likely_hardcoded` verdict prints a visible warning rather than serving silently). `--mode` (default `auto`) picks the pipeline: `auto` is the full `implementation → recorded → synthetic` chain; `record` replays only what was captured, 404 otherwise (byte-exact replay for regression tests, when determinism matters more than coherence); `impl` adds the inferred implementation but skips synthesis; `synthetic` skips the implementation — the escape hatch if a generated one misbehaves.
+
+**Latency replay** is opt-in and off by default — every response is instant unless you ask otherwise. Captures record `tsStart`/`tsEnd` per entry (the real request-sent/response-completed timestamps); `--latency` replays each recorded entry's own observed duration before answering, and an unrecorded (synthetic-tier) request replays the median observed duration for that endpoint template instead, since there's no single entry to read a duration off of. `--speed <factor>` scales the delay and implies `--latency`: `2` replays at twice real speed (half the delay), `0.5` at half real speed (double the delay); default `1` is real-time. `--no-latency` disables delay replay outright (equivalent to infinite speed — also the default, so it's mostly useful to override a script that otherwise passes `--speed`). Every delay is capped at 30s regardless of what was actually observed, and an entry with missing/invalid timestamps (pre-`tsStart`/`tsEnd` captures) always answers instantly.
 
 ![mockify list showing a saved capture, a look at its files and inferred templates, then a clean replay banner and a recorded-vs-synthesized curl comparison](assets/demo.gif)
 
@@ -192,7 +195,6 @@ MOCK_FAULT_RATE=0.1 npx mockify replay demo-grok
 
 - JSON request-body matching (currently form-encoded only)
 - Body matching for PUT/PATCH/DELETE (currently routed through GET matching)
-- Latency simulation from `tsStart`/`tsEnd` (captured but unused)
 - Sequence-aware/stateful replay
 
 ## License
