@@ -153,6 +153,19 @@ Two kinds of fields are never treated as a mismatch, and are listed separately (
 - A recorded field whose value is the redaction placeholder `"[REDACTED]"` — a redacted capture can never match a live value by construction, so it's excluded from diffing entirely.
 - A field that looks volatile by name (`id`, `createdAt`, `sessionToken`, `csrf`, ...) or by value shape (UUID, ISO timestamp, plausible unix-epoch integer) — the same tolerance specify's own replay prompt applies ("ignore timestamps, session IDs, CSRF tokens").
 
+## Compare two live targets
+
+`mockify compare --capture <name|path> --remote <url> --local <url>` is the deterministic port of specify's agent-driven `specify compare --remote --local`. A capture supplies the request list (what to ask); the same request is fired at both targets and the two live responses are diffed against each other with the exact comparator `replay --against` uses (`src/diff/engine.ts`, reused unchanged — see `src/compare/ab.ts`). `--remote` is the baseline (conventionally the reference/production system), `--local` the candidate being checked against it.
+
+```bash
+mockify compare --capture demo-grok --remote https://prod.example.com --local https://staging.example.com
+mockify compare --capture demo-grok --remote https://prod.example.com --local http://localhost:8080 --json
+mockify compare --capture demo-grok --remote https://prod.example.com --local http://localhost:8080 \
+  --remote-auth prod-user:prod-pass --local-auth dev-user:dev-pass
+```
+
+Exit code is `0` if every request matched between remote and local, `1` on any mismatch or request that failed to fire on either side. `--remote-auth`/`--local-auth` (`user:pass`) send Basic auth to the respective target. The same volatile-field tolerance as `replay --against` applies to the remote-vs-local body diff (`id`, `createdAt`, `sessionToken`, ... — see above). Redaction matters here on the *request* side, not the response side (both responses being compared are live, so there's nothing recorded to be `"[REDACTED]"`): a captured request header that was redacted at capture time (e.g. `Authorization`) is never forwarded literally to either target (`src/diff/fire.ts`) — use `--remote-auth`/`--local-auth` to supply real credentials instead.
+
 ## Quickstart
 
 ```bash

@@ -46,6 +46,19 @@
  *     timestamps, tokens). No agent involved. Exits 0 if every request
  *     matched, 1 on any mismatch or request failure.
  *
+ *   mockify compare --capture <name|path> --remote <url> --local <url>
+ *                    [--remote-auth user:pass] [--local-auth user:pass]
+ *                    [--json] [--timeout <ms>]
+ *     Deterministic port of specify's agent-driven `specify compare
+ *     --remote --local` (SP-7ow.3): the capture's traffic.json supplies the
+ *     request list, the same request is fired at both `--remote` (the
+ *     baseline) and `--local` (the candidate), and the two live responses
+ *     are diffed against each other with the exact comparator SP-7ow.2
+ *     built (src/compare/ab.ts reuses src/diff/engine.ts unchanged). Same
+ *     redacted-field exclusion and volatile-field tolerance as `replay
+ *     --against`. Exits 0 if every request matched, 1 on any mismatch or
+ *     request failure.
+ *
  *   mockify serve [--port N] [--data <path>]
  *     Back-compat alias for `replay`: starts the mock server against
  *     `--data` (or MOCK_DATA_PATH, or the newest capture found under
@@ -103,6 +116,7 @@ import { inferImplementation, type InferProgressEvent } from './infer/generate.j
 import { buildOpenApiDocument, formatFromPath, serializeOpenApiDocument } from './openapi/index.js';
 import { readCaptureTraffic, replayAgainst, type ReplayAgainstSummary } from './replay/against.js';
 import type { DiffResult } from './diff/engine.js';
+import { compareAB, type CompareSummary } from './compare/ab.js';
 
 function parseFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -122,6 +136,7 @@ const VALUE_FLAGS = new Set([
   '--storage-state', '--save-storage-state', '--timeout',
   '--impl', '--rounds', '--holdout', '--mode', '--out', '--speed',
   '--against', '--header',
+  '--capture', '--remote', '--local', '--remote-auth', '--local-auth',
 ]);
 
 /** First argument that isn't a flag or a flag's value. */
@@ -145,6 +160,7 @@ function printUsage(): void {
   console.error('  list [--json]                                       List saved captures');
   console.error('  replay <name|path> [--port N] [--mode M] [--impl <path>] [--latency|--speed N]  Replay a saved capture');
   console.error('  replay <name|path> --against <url> [--json] [--timeout ms] [--header "N: v"]  Fire captured requests at a live target and diff responses');
+  console.error('  compare --capture <name|path> --remote <url> --local <url> [--json]  Fire the same captured requests at two targets and diff them');
   console.error('  serve [--port N] [--data <path>] [--latency|--speed N]  Back-compat alias for replay');
   console.error('  synthesize --data <captureDir>                      Infer endpoint templates + response shapes for unrecorded requests');
   console.error('  validate <name|path> [--impl <path>] [--json]       Grade a generated implementation against a capture (train/holdout + hardcoding check)');
@@ -172,6 +188,17 @@ function printUsage(): void {
   console.error('                                  (use this to supply real auth for a header that was redacted at capture time)');
   console.error('  Exit code: 0 if every request matched, 1 on any mismatch or request failure.');
   console.error('  Note: a captured field whose recorded value is "[REDACTED]" can never match a live value and is excluded from diffing.');
+  console.error('');
+  console.error('compare options (deterministic: a capture supplies the request list, fired at both --remote and --local):');
+  console.error('  --capture <name|path>           Required — capture whose traffic.json supplies the requests to fire');
+  console.error('  --remote <url>                  Required — baseline target (conventionally the reference/production system)');
+  console.error('  --local <url>                   Required — candidate target being compared against --remote');
+  console.error('  --remote-auth <user:pass>       Basic-auth credentials sent to --remote');
+  console.error('  --local-auth <user:pass>        Basic-auth credentials sent to --local');
+  console.error('  --json                          Emit machine-readable JSON (per-request diff + summary counts) instead of a text report');
+  console.error('  --timeout <ms>                  Abort a single request after this many milliseconds (default: 15000)');
+  console.error('  Exit code: 0 if every request matched between remote and local, 1 on any mismatch or request failure.');
+  console.error('  Note: a captured field whose recorded value is "[REDACTED]" is excluded from diffing (same rule as replay --against).');
   console.error('');
   console.error('capture options:');
   console.error('  --name <name>                  Name to save the capture under (default: slugified from the URL)');
@@ -403,6 +430,101 @@ async function runReplayAgainst(nameOrPath: string, args: string[]): Promise<voi
       for (const r of summary.results) {
         if (!r.error && r.diff.match) continue;
         printDiffFailure(r.method, r.url, r.diff, r.error, 'recorded', 'live');
+      }
+    }
+  }
+
+  process.exit(summary.mismatched === 0 && summary.errored === 0 ? 0 : 1);
+}
+
+/** `mockify compare --capture <name|path> --remote <url> --local <url>` —
+ * deterministic port of specify's agent-driven `specify compare --remote
+ * --local` (SP-7ow.3): a capture supplies the request list, the same
+ * request is fired at both targets, and the two live responses are diffed
+ * against each other with the exact comparator SP-7ow.2 built
+ * (src/compare/ab.ts reuses src/diff/engine.ts unchanged). Exit 0 if every
+ * request matched between remote and local, 1 otherwise. */
+async function runCompare(args: string[]): Promise<void> {
+  const usage =
+    'Usage: mockify compare --capture <name|path> --remote <url> --local <url> ' +
+    '[--remote-auth user:pass] [--local-auth user:pass] [--json] [--timeout <ms>]';
+
+  const captureArg = parseFlag(args, '--capture');
+  const remoteUrl = parseFlag(args, '--remote');
+  const localUrl = parseFlag(args, '--local');
+
+  if (!captureArg || !remoteUrl || !localUrl) {
+    console.error('error: --capture, --remote, and --local are all required');
+    console.error(usage);
+    process.exit(1);
+    return;
+  }
+
+  let resolved: { name: string; dir: string };
+  try {
+    resolved = resolveCapture(captureArg);
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  for (const [label, url] of [['--remote', remoteUrl], ['--local', localUrl]] as const) {
+    try {
+      new URL(url);
+    } catch {
+      console.error(`error: ${label} must be a valid URL, got ${JSON.stringify(url)}`);
+      console.error(usage);
+      process.exit(1);
+      return;
+    }
+  }
+
+  const timeoutArg = parseFlag(args, '--timeout');
+  let timeoutMs: number | undefined;
+  if (timeoutArg !== undefined) {
+    timeoutMs = Number(timeoutArg);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      console.error(`error: --timeout must be a positive number of milliseconds, got ${JSON.stringify(timeoutArg)}`);
+      console.error(usage);
+      process.exit(1);
+      return;
+    }
+  }
+
+  const remoteAuth = parseFlag(args, '--remote-auth');
+  const localAuth = parseFlag(args, '--local-auth');
+  const jsonOut = hasFlag(args, '--json');
+
+  let entries;
+  try {
+    entries = readCaptureTraffic(resolved.dir);
+  } catch (err) {
+    console.error(`error: could not read traffic.json for "${resolved.name}": ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+    return;
+  }
+
+  const summary: CompareSummary = await compareAB(entries, remoteUrl, localUrl, { timeoutMs, remoteAuth, localAuth });
+
+  if (jsonOut) {
+    console.log(JSON.stringify(summary, null, 2));
+  } else {
+    console.log(`Compared "${resolved.name}" (${summary.total} request(s)): ${remoteUrl} (remote) vs ${localUrl} (local)`);
+    console.log(`  matched:    ${summary.matched}`);
+    console.log(`  mismatched: ${summary.mismatched}`);
+    console.log(`  errored:    ${summary.errored}`);
+    if (summary.mismatched > 0 || summary.errored > 0) {
+      console.log('');
+      for (const r of summary.results) {
+        if (!r.remoteError && !r.localError && r.diff.match) continue;
+        const combinedError = [
+          r.remoteError ? `remote: ${r.remoteError}` : undefined,
+          r.localError ? `local: ${r.localError}` : undefined,
+        ]
+          .filter(Boolean)
+          .join('; ') || undefined;
+        printDiffFailure(r.method, r.url, r.diff, combinedError, 'remote', 'local');
       }
     }
   }
@@ -1127,6 +1249,9 @@ async function main(): Promise<void> {
       return;
     case 'replay':
       await runReplay(rest);
+      return;
+    case 'compare':
+      await runCompare(rest);
       return;
     case 'list':
       runList(rest);
