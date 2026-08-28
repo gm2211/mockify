@@ -338,6 +338,77 @@ test('redaction also applies to entries recorded via attachToContext()\'s route 
 });
 
 // ---------------------------------------------------------------------------
+// onTrafficCaptured hook (SP-7ow.1) — lets a caller (the human-driven
+// recorder, src/recorders/browse-and-capture.ts) react to live traffic
+// without re-implementing route interception.
+// ---------------------------------------------------------------------------
+
+test('onTrafficCaptured fires once per captured entry, with the same (redacted) entry that lands in traffic', async () => {
+  const dir = tmpOutputDir();
+  const seen: unknown[] = [];
+  const collector = new CaptureCollector({
+    outputDir: dir,
+    targetUrl: 'https://x.test',
+    hostFilter: 'x.test',
+    onTrafficCaptured: (entry) => seen.push(entry),
+  });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://x.test/api/login', 'POST', {
+    postData: JSON.stringify({ password: 'hunter2' }),
+    responseBody: JSON.stringify({ token: 'abc123' }),
+  });
+  await getHandler()(route);
+
+  assert.equal(seen.length, 1);
+  // Same object identity as what's in getTraffic() — not a second, separately
+  // constructed (and potentially unredacted) copy.
+  assert.equal(seen[0], collector.getTraffic()[0]);
+});
+
+test('onTrafficCaptured receives the already-redacted entry, not the raw one', async () => {
+  const dir = tmpOutputDir();
+  let capturedToken: string | undefined;
+  const collector = new CaptureCollector({
+    outputDir: dir,
+    targetUrl: 'https://x.test',
+    hostFilter: 'x.test',
+    onTrafficCaptured: (entry) => {
+      capturedToken = JSON.parse(entry.responseBody!).token;
+    },
+  });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://x.test/api/login', 'POST', {
+    responseBody: JSON.stringify({ token: 'abc123' }),
+  });
+  await getHandler()(route);
+
+  assert.equal(capturedToken, '[REDACTED]');
+});
+
+test('onTrafficCaptured is not called for requests filtered out by the host filter', async () => {
+  const dir = tmpOutputDir();
+  let calls = 0;
+  const collector = new CaptureCollector({
+    outputDir: dir,
+    targetUrl: 'https://x.test',
+    hostFilter: 'x.test',
+    onTrafficCaptured: () => { calls++; },
+  });
+  const { context, getHandler } = fakeContext();
+  await collector.attachToContext(context as never);
+
+  const { route } = fakeRoute('https://tracker.other-domain.com/pixel', 'GET');
+  await getHandler()(route);
+
+  assert.equal(calls, 0);
+  assert.equal(collector.getTraffic().length, 0);
+});
+
+// ---------------------------------------------------------------------------
 // Header capture and redaction (SP-lsc.8)
 // ---------------------------------------------------------------------------
 

@@ -2,7 +2,7 @@
  * src/capture/types.ts — TypeScript types for capture output
  *
  * These types describe the data produced by the capture scripts
- * (browse-and-capture.mjs, cdp-capture.ts) and consumed by the
+ * (browse-and-capture.ts, cdp-capture.ts) and consumed by the
  * spec generator and future validator.
  */
 

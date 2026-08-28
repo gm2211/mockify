@@ -141,9 +141,10 @@ export function summarizeCapture(name: string, dir: string): CaptureSummary | nu
   // As of SP-lsc.6, CaptureCollector.save() (src/agent/capture.ts) itself
   // derives totalScreenshots from the same on-disk enumeration, so new
   // manifests can't disagree with reality — but this workaround stays:
-  // captures already on disk (written before that fix) and captures from
-  // other writers (e.g. src/recorders/browse-and-capture.mjs) still carry
-  // the old counter-based field, and this function has to summarize both.
+  // captures already on disk (written before that fix, including by the
+  // now-retired plain-JS browse-and-capture.mjs recorder, since replaced by
+  // src/recorders/browse-and-capture.ts) still carry the old counter-based
+  // field, and this function has to summarize both.
   let screenshots = 0;
   const screenshotDir = path.join(dir, 'screenshots');
   try {

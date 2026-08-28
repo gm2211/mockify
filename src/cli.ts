@@ -9,13 +9,16 @@
  *                    [--timeout <seconds>] [--no-redact]
  *     Agent mode (default): drives a Claude agent (src/agent/runner.ts) that
  *     explores the target and records real traffic/console/screenshots.
- *     `--manual` instead runs the browse-and-capture recorder
- *     (src/recorders/browse-and-capture.mjs), which opens a visible browser
- *     for a human to drive. `record` is kept as a hidden alias for `capture`.
- *     The capture is saved under a name (src/captures/store.ts): `--name`
- *     wins, otherwise the name defaults to a slug of the target URL's
- *     hostname (e.g. `automationintesting-online`). `--output <dir>` bypasses
- *     naming entirely and writes straight to `<dir>`.
+ *     `--manual` instead runs the human-driven recorder
+ *     (src/recorders/browse-and-capture.ts), which opens a visible browser
+ *     for a human to drive — no API key needed. Both modes share the same
+ *     CaptureCollector (src/agent/capture.ts), so traffic capture, console
+ *     logging, redaction, and `--storage-state` / `--save-storage-state`
+ *     behave identically between them. `record` is kept as a hidden alias
+ *     for `capture`. The capture is saved under a name (src/captures/store.ts):
+ *     `--name` wins, otherwise the name defaults to a slug of the target
+ *     URL's hostname (e.g. `automationintesting-online`). `--output <dir>`
+ *     bypasses naming entirely and writes straight to `<dir>`.
  *     Credential-bearing body fields (token/password/apiKey/secret/session/
  *     bearer, nested included) are redacted before traffic.json is written
  *     (src/format/redact.ts); `--no-redact` disables this and writes raw
@@ -73,8 +76,6 @@
  *     unless `--out` ends in `.json`.
  */
 
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { runCaptureAgent } from './agent/runner.js';
@@ -89,8 +90,6 @@ import { validateImplementation, type Grade, type ValidationResult } from './inf
 import { computeGap, scanForHardcoding } from './infer/hardcoding.js';
 import { inferImplementation, type InferProgressEvent } from './infer/generate.js';
 import { buildOpenApiDocument, formatFromPath, serializeOpenApiDocument } from './openapi/index.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function parseFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -386,36 +385,64 @@ function runList(args: string[]): void {
 // capture — record traffic from a live site
 // ---------------------------------------------------------------------------
 
-function runManualCapture(url: string, args: string[]): void {
+async function runManualCapture(url: string, args: string[]): Promise<void> {
   const outputArg = parseFlag(args, '--output');
   const nameArg = parseFlag(args, '--name');
-  const recorderPath = path.join(__dirname, 'recorders', 'browse-and-capture.mjs');
+  const storageState = parseFlag(args, '--storage-state');
+  const saveStorageState = parseFlag(args, '--save-storage-state');
 
-  const env: NodeJS.ProcessEnv = { ...process.env, TARGET_BASE_URL: url };
+  let outputDir: string;
+  let captureName: string;
   if (outputArg) {
-    env.CAPTURE_OUTPUT_DIR = path.resolve(process.cwd(), outputArg);
+    outputDir = path.resolve(process.cwd(), outputArg);
+    captureName = path.basename(outputDir);
   } else {
     // No explicit --output: default to a named capture directory (same
     // naming as agent/MCP captures) so this shows up in `mockify list`.
     const allocated = allocateCaptureDir(url, nameArg);
-    env.CAPTURE_EXACT_OUTPUT_DIR = allocated.dir;
+    outputDir = allocated.dir;
+    captureName = allocated.name;
   }
-  // --no-redact escape hatch (see src/format/redact.ts): forwarded to the
-  // spawned recorder as an env var since it's a separate process.
+
+  // --no-redact escape hatch (see src/format/redact.ts). Read by
+  // CaptureCollector's own default resolution (no explicit `redact` option
+  // is threaded through here), same as the agent-driven path below.
   if (hasFlag(args, '--no-redact')) {
-    env.MOCKIFY_NO_REDACT = '1';
+    process.env.MOCKIFY_NO_REDACT = '1';
   }
 
-  const child = spawn(process.execPath, [recorderPath], {
-    stdio: 'inherit',
-    env,
-  });
+  // Pre-validate --storage-state before launching a browser, so a bad path
+  // or missing keychain item fails fast with a clear message.
+  if (storageState) {
+    const resolved = await resolveStorageStateInput(storageState, (msg) => console.error(msg));
+    if (!resolved.ok) {
+      console.error(`error: ${resolved.error.error}: ${resolved.error.hint} (${resolved.error.target})`);
+      process.exit(1);
+    }
+  }
 
-  child.on('exit', (code) => process.exit(code ?? 0));
-  child.on('error', (err) => {
-    console.error(`[mockify] Failed to launch recorder: ${err.message}`);
+  try {
+    const { runBrowseAndCapture } = await import('./recorders/browse-and-capture.js');
+    await runBrowseAndCapture({
+      url,
+      outputDir,
+      storageState,
+      saveStorageState,
+      log: (msg) => console.error(msg),
+    });
+
+    const summary = summarizeCapture(captureName, outputDir);
+    const requests = summary?.requests ?? 0;
+    const screenshots = summary?.screenshots ?? 0;
+    const syntheticTemplates = summary?.syntheticTemplates ?? 0;
+    console.error(
+      `Capture saved as "${captureName}" (${requests} requests, ${screenshots} screenshots, ${syntheticTemplates} synthetic templates)`
+    );
+    console.error(`Replay it:  mockify replay ${captureName}`);
+  } catch (err) {
+    console.error(`error: capture failed: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
-  });
+  }
 }
 
 async function runAgentCapture(url: string, args: string[]): Promise<void> {
@@ -520,7 +547,7 @@ async function runCapture(args: string[]): Promise<void> {
   }
 
   if (hasFlag(args, '--manual')) {
-    runManualCapture(url, args);
+    await runManualCapture(url, args);
     return;
   }
 
