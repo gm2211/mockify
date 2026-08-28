@@ -131,6 +131,16 @@ export interface CaptureCollectorOptions {
    * out regardless of the env var (used by tests).
    */
   redact?: boolean;
+  /**
+   * Optional hook fired synchronously from attachToContext()'s route
+   * handler right after a traffic entry is recorded (post-redaction — the
+   * entry passed here is the same one that landed in `this.traffic`).
+   * Callers that want to react to live traffic without polling
+   * getTraffic() — e.g. the manual/human capture recorder scheduling a
+   * debounced screenshot after a JSON API response — can observe entries
+   * here instead of re-implementing route interception themselves.
+   */
+  onTrafficCaptured?: (entry: CapturedTraffic) => void;
 }
 
 export class CaptureCollector {
@@ -150,6 +160,7 @@ export class CaptureCollector {
   private hostFilter: string;
   private startTime: string;
   private redact: boolean;
+  private onTrafficCaptured?: (entry: CapturedTraffic) => void;
 
   constructor(options: CaptureCollectorOptions) {
     this.outputDir = path.resolve(options.outputDir);
@@ -158,6 +169,7 @@ export class CaptureCollector {
     this.hostFilter = options.hostFilter ?? '';
     this.startTime = new Date().toISOString();
     this.redact = options.redact ?? !envDisablesRedaction();
+    this.onTrafficCaptured = options.onTrafficCaptured;
 
     fs.mkdirSync(this.screenshotDir, { recursive: true });
   }
@@ -218,7 +230,9 @@ export class CaptureCollector {
           }
         }
 
-        this.traffic.push(this.redact ? redactTrafficEntry(entry) : entry);
+        const recorded = this.redact ? redactTrafficEntry(entry) : entry;
+        this.traffic.push(recorded);
+        this.onTrafficCaptured?.(recorded);
       }
     });
   }

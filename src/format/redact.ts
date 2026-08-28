@@ -9,9 +9,10 @@
  * needs to be the default, not an opt-in.
  *
  * This module is the shared redaction logic applied at every capture write
- * path (src/agent/capture.ts's CaptureCollector, src/recorders/cdp-capture.ts,
- * and — ported to plain JS, since it has no build step — src/recorders/
- * browse-and-capture.mjs). It does two things:
+ * path — src/agent/capture.ts's CaptureCollector (used by both the
+ * agent-driven and human-driven capture modes, the latter via
+ * src/recorders/browse-and-capture.ts) and src/recorders/cdp-capture.ts. It
+ * does two things:
  *
  *   1. Replaces credential-bearing header VALUES (Authorization, Cookie,
  *      Set-Cookie, X-Api-Key, ...) with a stable placeholder.

@@ -2,7 +2,7 @@
  * src/mock-server.ts — HTTP replay mock server
  *
  * What it does:
- *   - Replays captured traffic from browse-and-capture.mjs or cdp-capture.ts
+ *   - Replays captured traffic from browse-and-capture.ts or cdp-capture.ts
  *   - Manages sessions with configurable cookie names
  *   - Supports fault injection (302, 500, timeout, empty, malformed responses)
  *   - Provides diagnostic endpoints (/_traffic, /_faults, /_sessions)
