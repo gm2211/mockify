@@ -78,6 +78,20 @@
  * synthetic tiers entirely, giving byte-exact recorded replay when
  * determinism matters more than coherence. Set MOCK_SYNTHETIC=0 to disable
  * tier 3 outright regardless of mode.
+ *
+ * -- Latency replay (src/latency.ts) ----------------------------------------
+ * Opt-in via `mockify serve/replay --latency` or `--speed <factor>` (default:
+ * disabled — every response is instant, matching pre-SP-lsc.10 behavior).
+ * When enabled, a tier 2 (recorded) response delays by the matched entry's
+ * own observed tsStart/tsEnd duration; a tier 3 (synthetic) response delays
+ * by the median observed duration among entries matching that endpoint
+ * template, falling back to the capture's overall median. `speed` scales the
+ * delay (`2` = twice real speed = half the delay, `0.5` = half real speed =
+ * double the delay); every delay is capped at latency.ts's MAX_DELAY_MS
+ * regardless of speed, and missing/invalid timestamps replay with no delay.
+ * Tier 1 (implementation) and the tier 4 404 fallback are never delayed —
+ * an implementation is generated code with no captured timing of its own,
+ * and there's nothing to reproduce timing *for* once nothing matched.
  */
 
 import * as http from 'http';
@@ -100,6 +114,18 @@ import {
   type HandleResponse,
   type Implementation,
 } from './infer/contract.js';
+import {
+  computeEntryDelayMs,
+  buildTemplateLatencyIndex,
+  resolveSyntheticDelayMs,
+  delayFor,
+  DEFAULT_LATENCY_OPTIONS,
+  MAX_DELAY_MS,
+  type LatencyOptions,
+  type TemplateLatencyIndex,
+} from './latency.js';
+
+export type { LatencyOptions } from './latency.js';
 
 // Capture discovery is relative to the current working directory (the
 // directory `mockify serve` is run from), not this module's own location —
@@ -822,7 +848,9 @@ function createServer(
   index: RouteIndex,
   synthetic: SyntheticIndex | null,
   mode: ReplayMode,
-  loadedImpl: LoadedImplementation
+  loadedImpl: LoadedImplementation,
+  latency: LatencyOptions,
+  templateLatencyIndex: TemplateLatencyIndex | null
 ): http.Server {
   const loginHtml = buildLoginHtml();
   const syntheticStats: SyntheticStats = {
@@ -1115,6 +1143,17 @@ function createServer(
           return;
         }
 
+        // ── Latency replay (opt-in, src/latency.ts) ───────────────────────
+        // Delay by this exact entry's own observed tsStart/tsEnd duration
+        // (scaled by --speed, capped at MAX_DELAY_MS) before answering — 0
+        // when latency replay is disabled or the entry has no valid
+        // timestamps.
+        const recordedDelayMs = computeEntryDelayMs(entry, latency);
+        if (recordedDelayMs > 0) {
+          rlog(`[mock] ${method} ${pathname} → delaying ${Math.round(recordedDelayMs)}ms (recorded)`);
+          await delayFor(recordedDelayMs);
+        }
+
         // ── Send recorded response ──────────────────────────────────────
         // Replays every captured response header (Set-Cookie, CORS's
         // Access-Control-Allow-*, ...), not just Content-Type — hop-by-hop
@@ -1138,6 +1177,19 @@ function createServer(
       const match = matchSyntheticTemplate(synthetic.templates, method, pathname);
       if (match) {
         syntheticStats.hits++;
+
+        // ── Latency replay (opt-in, src/latency.ts) ───────────────────────
+        // No single captured entry to read tsStart/tsEnd off of here — use
+        // this template's median observed duration (falling back to the
+        // capture's overall median, then 0) instead.
+        if (templateLatencyIndex) {
+          const syntheticDelayMs = resolveSyntheticDelayMs(match.template, templateLatencyIndex, latency);
+          if (syntheticDelayMs > 0) {
+            rlog(`[mock] ${method} ${pathname} → delaying ${Math.round(syntheticDelayMs)}ms (synthetic)`);
+            await delayFor(syntheticDelayMs);
+          }
+        }
+
         const body = synthesizeResponseBody(match.template, match.params, method, pathname);
         const responseBody =
           typeof body === 'string' ? body : JSON.stringify(body);
@@ -1198,6 +1250,11 @@ export interface StartMockServerOptions {
    * `<captureDir>/impl/handlers.mjs` — `mockify replay --impl <path>`, and
    * how tests exercise a fixture implementation without moving files. */
   implPath?: string;
+  /** Captured per-endpoint latency replay (src/latency.ts) —
+   * `mockify serve/replay --latency`/`--speed <n>`/`--no-latency`. Defaults
+   * to DEFAULT_LATENCY_OPTIONS (disabled — every response is instant,
+   * preserving pre-SP-lsc.10 behavior) when omitted. */
+  latency?: LatencyOptions;
 }
 
 export interface StartedMockServer {
@@ -1214,6 +1271,10 @@ export interface StartedMockServer {
    * reports, so `mockify replay`'s banner can be built from the same data
    * without a second file read. */
   implementation: LoadedImplementation;
+  /** The resolved latency-replay configuration actually in effect (never
+   * undefined, unlike the input option) — echoed back so `mockify replay`'s
+   * banner can report it without re-deriving defaults. */
+  latency: LatencyOptions;
 }
 
 /**
@@ -1267,7 +1328,22 @@ export async function startMockServer(opts: StartMockServerOptions = {}): Promis
     await loadedImpl.impl.reset();
   }
 
-  const server = createServer(entries, index, synthetic, mode, loadedImpl);
+  const latency: LatencyOptions = opts.latency ?? DEFAULT_LATENCY_OPTIONS;
+  // Only built when latency replay is actually enabled — building it is an
+  // O(entries × templates) scan (buildTemplateLatencyIndex), and the default
+  // (disabled) path should stay exactly as cheap as it was before SP-lsc.10.
+  const templateLatencyIndex: TemplateLatencyIndex | null =
+    latency.enabled && synthetic ? buildTemplateLatencyIndex(entries, synthetic.templates) : null;
+  if (latency.enabled) {
+    slog(
+      `[mock] Latency replay ENABLED: speed=${latency.speed}x (captured tsStart/tsEnd durations, ` +
+        `capped at ${MAX_DELAY_MS}ms)`
+    );
+  } else {
+    slog('[mock] Latency replay disabled (pass --latency or --speed <n> to mockify serve/replay to enable)');
+  }
+
+  const server = createServer(entries, index, synthetic, mode, loadedImpl, latency, templateLatencyIndex);
 
   return new Promise((resolve) => {
     server.listen(port, () => {
@@ -1295,6 +1371,7 @@ export async function startMockServer(opts: StartMockServerOptions = {}): Promis
         syntheticTemplateCount: synthetic?.templates.length ?? 0,
         mode,
         implementation: loadedImpl,
+        latency,
       });
     });
   });

@@ -132,14 +132,16 @@ function waitForListening(
  *
  * `env` is merged over `process.env` (e.g. `MOCK_DATA_PATH`, `MOCK_SYNTHETIC`).
  * A random port in the 34567-35566 range is picked and passed as `PORT`
- * unless the caller already set one.
+ * unless the caller already set one. `opts.args` appends extra CLI flags
+ * after `serve` (e.g. `['--speed', '2']`, `['--no-latency']`) for tests that
+ * need to exercise flag parsing rather than env-var-driven config.
  */
 export async function spawnMockServer(
   env: Record<string, string> = {},
-  opts: { timeoutMs?: number } = {}
+  opts: { timeoutMs?: number; args?: string[] } = {}
 ): Promise<SpawnedMockServer> {
   const requestedPort = env.PORT ?? String(34567 + Math.floor(Math.random() * 1000));
-  const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, 'serve'], {
+  const child = spawn(process.execPath, ['--import', 'tsx', CLI_PATH, 'serve', ...(opts.args ?? [])], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
